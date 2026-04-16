@@ -206,3 +206,9 @@ npm start
 
 💡 Inspiration
  - EduPath AI aims to bridge the gap between personalized education and accessibility using AI.
+
+<h2 align="center">🧭 System Workflow & Architecture</h2>
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Xavierdivya/TR-076-The-Noble-Four/refs/heads/main/src/assets/workflow.png" width="900"/>
+</p>
