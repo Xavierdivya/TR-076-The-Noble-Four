@@ -1,498 +1,735 @@
 /**
- * EduPath — EXTENDED v2 (Non-breaking additions to existing codebase)
- *
- * ── EXISTING FEATURES (PRESERVED UNCHANGED) ──────────────────────────────────
- *   ✅ Parent registration & auth
- *   ✅ Child profile management
- *   ✅ AI-based initial assessment (Feature 1 from v1)
- *   ✅ Week 1 learning plan generation (Feature 2 from v1)
- *   ✅ Weekly AI evaluation loop (Feature 3 from v1)
- *   ✅ Progress decision logic ADVANCE/MODIFY (Feature 4 from v1)
- *   ✅ Continuous weekly loop (Feature 5 from v1)
- *
- * ── NEW FEATURES ADDED IN v2 ─────────────────────────────────────────────────
- *   🆕 Feature 1: Milestones Tracking — 2-5 per week, auto-updated after eval
- *   🆕 Feature 2: Progress Graph — Recharts line chart (week vs score)
- *   🆕 Feature 3: Learning Summary (English + Tamil) — Claude translates
- *   🆕 Feature 4: Educator Assignment — match by specialization, wait message
- *   🆕 Feature 5: Enhanced Weekly Loop — milestones generated alongside plans
- *
- * ── ARCHITECTURE ─────────────────────────────────────────────────────────────
- *   /services/aiService.js         — All Claude API calls (extended)
- *   /services/assessmentService.js — CRUD (extended)
- *   /services/milestoneService.js  — NEW: milestone CRUD
- *   /services/progressService.js   — NEW: GET /api/progress/:childId
- *   /services/summaryService.js    — NEW: weekly summary store
- *   /services/educatorService.js   — NEW: specialization-based matching
- *   /models/Milestone.js           — NEW MongoDB schema
- *   /models/WeeklySummary.js       — NEW MongoDB schema
- *
- * ── MONGODB NEW SCHEMAS ───────────────────────────────────────────────────────
- *
- * Milestone:
- * {
- *   _id: ObjectId,
- *   childId: ObjectId,
- *   week: Number,
- *   milestones: [{ title, description, status: "PENDING" | "COMPLETED" }]
- * }
- *
- * WeeklySummary:
- * {
- *   _id: ObjectId,
- *   childId: ObjectId,
- *   week: Number,
- *   summaryEnglish: String,
- *   summaryRegional: String,  // Tamil
- *   createdAt: Date
- * }
+ * ╔═══════════════════════════════════════════════════════════════════════════════╗
+ * ║  EduPath — v4  (Special Needs Education Plan Generator)                      ║
+ * ╠═══════════════════════════════════════════════════════════════════════════════╣
+ * ║  WHAT'S NEW IN v4                                                             ║
+ * ║  ✅ Grade mapping EXTENDED: Age 5–17 → Grade 1–12                            ║
+ * ║  ✅ Subjects defined for ALL 12 grades (Grade 1 through Grade 12)            ║
+ * ║  ✅ LANGUAGE BUG FIXED: Only Tamil & English shown (others were broken)      ║
+ * ║     Root cause: API returned garbled/English text for Hindi/Telugu/etc.      ║
+ * ║     Fix: SUPPORTED_LANGUAGES trimmed to ["English","Tamil"] only.            ║
+ * ║     Summary generation now asks only for en+ta, fallbacks are reliable.     ║
+ * ║  ✅ Multi-Domain Assessment (IQ · Cognitive · Motor · Communication)         ║
+ * ║  ✅ Dynamic IEP Generation (grade-aligned, ability-modified)                 ║
+ * ║  ✅ MongoDB-ready schemas (User · Assessment · EducationPlan)                ║
+ * ║  ✅ isNewUser flow: assessment gate before dashboard                         ║
+ * ╠═══════════════════════════════════════════════════════════════════════════════╣
+ * ║  PRESERVED FROM v3                                                            ║
+ * ║  ✅ Milestones Tracking  ✅ Progress Graph (Recharts)                        ║
+ * ║  ✅ Weekly Evaluation Loop (ADVANCE / MODIFY)                                ║
+ * ║  ✅ Educator Assignment by Specialization                                    ║
+ * ╠═══════════════════════════════════════════════════════════════════════════════╣
+ * ║  BACKEND ARCHITECTURE (Express + MongoDB) — inline documentation             ║
+ * ║  POST /api/assessment      — save multi-domain scores, compute overallLevel  ║
+ * ║  GET  /api/education-plan/:userId — grade-aligned IEP for user               ║
+ * ║  GET  /api/progress/:userId       — week-by-week score history               ║
+ * ╚═══════════════════════════════════════════════════════════════════════════════╝
  */
 
-import { useState, useEffect, useCallback, useRef } from "react";
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from "recharts";
+import { useState, useEffect, useCallback } from "react";
+import {
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
+  ResponsiveContainer, ReferenceLine,
+} from "recharts";
 
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 1 — CURRICULUM ENGINE  (/services/curriculumService.js)
+// Age → Grade → Subjects. Extended to Grade 12 per request.
+// Reference: NCEO (National Center on Educational Outcomes)
+// ════════════════════════════════════════════════════════════════════════════════
+
+const curriculumEngine = {
+  /**
+   * Age → Grade mapping (Indian school norms, extended to Grade 12).
+   * Age 5–6 → 1 | 6–7 → 2 | 7–8 → 3 | 8–9 → 4 | 9–10 → 5 | 10–11 → 6
+   * 11–12 → 7 | 12–13 → 8 | 13–14 → 9 | 14–15 → 10 | 15–16 → 11 | 16–17 → 12
+   */
+  getGradeFromAge: (age) => {
+    const n = parseInt(age, 10);
+    if (n <= 5)  return 1;
+    if (n >= 17) return 12;
+    // age maps to grade = age - 4 (age 6 → grade 2, age 7 → grade 3, …, age 16 → grade 12)
+    const map = { 5: 1, 6: 2, 7: 3, 8: 4, 9: 5, 10: 6, 11: 7, 12: 8, 13: 9, 14: 10, 15: 11, 16: 12 };
+    return map[n] ?? Math.max(1, Math.min(12, n - 4));
+  },
+
+  /** Age-range label for display. */
+  getAgeRangeForGrade: (grade) => {
+    const ranges = {
+      1: "Age 5–6",  2: "Age 6–7",  3: "Age 7–8",  4: "Age 8–9",
+      5: "Age 9–10", 6: "Age 10–11", 7: "Age 11–12", 8: "Age 12–13",
+      9: "Age 13–14", 10: "Age 14–15", 11: "Age 15–16", 12: "Age 16–17",
+    };
+    return ranges[grade] ?? "Age unknown";
+  },
+
+  /**
+   * Grade → Subjects with curriculum focus descriptor.
+   * All 12 grades defined as required.
+   */
+  getSubjectsForGrade: (grade) => {
+    const curriculum = {
+      1: { label: "Grade 1", subjects: [
+        { name: "Language Arts",         icon: "📖", focus: "Phonics, letter recognition, simple words" },
+        { name: "Mathematics",           icon: "🔢", focus: "Counting 1–20, basic shapes, patterns" },
+        { name: "Environmental Studies", icon: "🌿", focus: "My body, family, home, surroundings" },
+        { name: "Art & Craft",           icon: "🎨", focus: "Drawing, colouring, basic motor skills" },
+      ]},
+      2: { label: "Grade 2", subjects: [
+        { name: "Language Arts",         icon: "📖", focus: "Reading simple sentences, basic writing" },
+        { name: "Mathematics",           icon: "🔢", focus: "Addition, subtraction up to 100" },
+        { name: "Environmental Studies", icon: "🌿", focus: "Plants, animals, seasons, community" },
+        { name: "Art & Craft",           icon: "🎨", focus: "Creative drawing, clay modelling" },
+      ]},
+      3: { label: "Grade 3", subjects: [
+        { name: "English",       icon: "📖", focus: "Reading paragraphs, composition writing" },
+        { name: "Mathematics",   icon: "🔢", focus: "Multiplication, division, fractions" },
+        { name: "Science",       icon: "🔬", focus: "Living/non-living, food, water, air" },
+        { name: "Social Studies",icon: "🌏", focus: "Maps, community helpers, festivals" },
+      ]},
+      4: { label: "Grade 4", subjects: [
+        { name: "English",       icon: "📖", focus: "Essay writing, comprehension, grammar" },
+        { name: "Mathematics",   icon: "🔢", focus: "Large numbers, geometry, measurement" },
+        { name: "Science",       icon: "🔬", focus: "Plants, animals, matter, simple machines" },
+        { name: "Social Science",icon: "🌏", focus: "History, civics, geography basics" },
+      ]},
+      5: { label: "Grade 5", subjects: [
+        { name: "Mathematics",   icon: "🔢", focus: "Decimals, percentages, area, perimeter" },
+        { name: "Science",       icon: "🔬", focus: "Human body, ecosystems, forces, light" },
+        { name: "English",       icon: "📖", focus: "Literature, formal writing, vocabulary" },
+        { name: "Social Science",icon: "🌏", focus: "Ancient civilisations, Indian geography" },
+      ]},
+      6: { label: "Grade 6", subjects: [
+        { name: "Mathematics",    icon: "🔢", focus: "Integers, algebra basics, ratio, proportion" },
+        { name: "Science",        icon: "🔬", focus: "Cells, tissues, electricity, materials" },
+        { name: "English",        icon: "📖", focus: "Literature analysis, report writing, debate" },
+        { name: "Social Science", icon: "🌏", focus: "Medieval history, economic geography" },
+        { name: "Computer Basics",icon: "💻", focus: "Digital literacy, MS Office basics" },
+      ]},
+      7: { label: "Grade 7", subjects: [
+        { name: "Mathematics",    icon: "🔢", focus: "Linear equations, triangles, data handling" },
+        { name: "Science",        icon: "🔬", focus: "Nutrition, heat, acids/bases, weather" },
+        { name: "English",        icon: "📖", focus: "Poetry analysis, letter writing, grammar" },
+        { name: "Social Science", icon: "🌏", focus: "Medieval India, state governments, resources" },
+        { name: "Computer Science",icon: "💻", focus: "Basics of programming, internet, spreadsheets" },
+      ]},
+      8: { label: "Grade 8", subjects: [
+        { name: "Mathematics",    icon: "🔢", focus: "Rational numbers, factorisation, graphs" },
+        { name: "Science",        icon: "🔬", focus: "Crop production, microbes, friction, sound" },
+        { name: "English",        icon: "📖", focus: "Short stories, descriptive writing, speech" },
+        { name: "Social Science", icon: "🌏", focus: "Modern India, industry, landforms" },
+        { name: "Computer Science",icon: "💻", focus: "HTML basics, Python introduction" },
+      ]},
+      9: { label: "Grade 9", subjects: [
+        { name: "Mathematics",    icon: "🔢", focus: "Polynomials, coordinate geometry, statistics" },
+        { name: "Science",        icon: "🔬", focus: "Matter, atoms, motion, living organisms" },
+        { name: "English",        icon: "📖", focus: "Novel study, formal essays, public speaking" },
+        { name: "Social Science", icon: "🌏", focus: "French Revolution, democracy, economics" },
+        { name: "Computer Science",icon: "💻", focus: "Python basics, algorithms, number systems" },
+      ]},
+      10: { label: "Grade 10", subjects: [
+        { name: "Mathematics",    icon: "🔢", focus: "Real numbers, trigonometry, probability" },
+        { name: "Science",        icon: "🔬", focus: "Chemical reactions, electricity, heredity" },
+        { name: "English",        icon: "📖", focus: "Board-level writing, comprehension, grammar" },
+        { name: "Social Science", icon: "🌏", focus: "Nationalism, democracy, development" },
+        { name: "Computer Science",icon: "💻", focus: "SQL, Python OOP, cybersecurity basics" },
+      ]},
+      11: { label: "Grade 11", subjects: [
+        { name: "Mathematics",    icon: "🔢", focus: "Sets, relations, trigonometry, limits" },
+        { name: "Physics",        icon: "⚛️", focus: "Kinematics, laws of motion, thermodynamics" },
+        { name: "Chemistry",      icon: "🧪", focus: "Atomic structure, periodic table, bonding" },
+        { name: "English",        icon: "📖", focus: "Advanced comprehension, literary analysis" },
+        { name: "Computer Science",icon: "💻", focus: "Python advanced, data structures, DBMS" },
+      ]},
+      12: { label: "Grade 12", subjects: [
+        { name: "Mathematics",    icon: "🔢", focus: "Calculus, vectors, linear programming" },
+        { name: "Physics",        icon: "⚛️", focus: "Electromagnetism, optics, modern physics" },
+        { name: "Chemistry",      icon: "🧪", focus: "Electrochemistry, polymers, biomolecules" },
+        { name: "English",        icon: "📖", focus: "Board essays, creative writing, debate" },
+        { name: "Computer Science",icon: "💻", focus: "Python projects, networking, web dev basics" },
+      ]},
+    };
+    return curriculum[grade] ?? curriculum[5];
+  },
+
+  /**
+   * Returns IEP modification descriptor for a given ability level.
+   * LOW = highly simplified; MEDIUM = modified; HIGH = near grade-level
+   */
+  getSubjectModifications: (level) => ({
+    LOW:    { approach: "Highly simplified, concrete, multisensory",        accommodation: "Extended time, visual supports, 1:1 support",          goal_prefix: "With maximum support, the student will" },
+    MEDIUM: { approach: "Simplified content with peer support",             accommodation: "Modified assignments, visual organizers, extra time",    goal_prefix: "With moderate support, the student will" },
+    HIGH:   { approach: "Grade-level content with minor modifications",      accommodation: "Preferential seating, check-ins, assistive tech",       goal_prefix: "Independently, the student will" },
+  }[level] ?? { approach: "Scaffolded instruction", accommodation: "Visual supports", goal_prefix: "With support, the student will" }),
+};
+
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 2 — LANGUAGE ENGINE  (/services/translationService.js)
+//
+// ⚠️  LANGUAGE BUG FIX (v3 → v4)
 // ─────────────────────────────────────────────────────────────────────────────
-// MOCK DB — Extended with new collections (existing data preserved)
-// ─────────────────────────────────────────────────────────────────────────────
+// Problem in v3: The UI showed 6 language options (EN, TA, HI, TE, ML, KN).
+// The API prompt asked Claude to return JSON with all 6 keys.
+// In practice, only "en" and "ta" keys returned correct content.
+// The other 4 keys were either:
+//   - Returned in English (model refused/fell back silently)
+//   - Returned garbled Unicode that displayed as boxes
+//   - Omitted entirely (JSON key missing), causing "undefined" in UI
+//
+// Fix applied in v4:
+//   1. SUPPORTED_LANGUAGES now contains ONLY English and Tamil.
+//   2. Registration form only offers these two choices.
+//   3. The summary prompt asks for en + ta ONLY — this is reliable.
+//   4. Fallback strings are correct and tested for both languages.
+//   5. WeeklySummaryCard only renders EN/TA toggle buttons.
+//
+// If more languages are needed in future, add a dedicated translation
+// pass using a separate API call per language, not a single JSON prompt.
+// ────────────────────────────────────────────────────────────────────────────
+const SUPPORTED_LANGUAGES = [
+  { code: "en", label: "English", flag: "🇬🇧", nativeName: "English" },
+  { code: "ta", label: "Tamil",   flag: "🇮🇳", nativeName: "தமிழ்"  },
+];
+
+const languageEngine = {
+  /** Build prompt that asks for ONLY en + ta (reliable). */
+  buildSummaryPrompt: (childData, iepPlan, evaluation) => `You are a special education summary writer fluent in English and Tamil (தமிழ்).
+
+Generate a warm, encouraging weekly learning summary in BOTH English AND Tamil.
+
+Child: ${childData.childName}, Age ${childData.age}, ${childData.disabilityType}
+Week: ${iepPlan?.weekNumber ?? 1}
+Score: ${evaluation.score}/100
+Improvement: ${evaluation.improvement >= 0 ? "+" : ""}${evaluation.improvement}
+Decision: ${evaluation.aiDecision}
+Goal: ${iepPlan?.learningOutcome ?? "Learning and development"}
+
+Write 2–3 warm, encouraging sentences per language. Parents should feel motivated.
+Return ONLY valid JSON — no markdown fences, no extra keys:
+{
+  "en": "English summary here...",
+  "ta": "தமிழ் சுருக்கம் இங்கே..."
+}`,
+
+  /** Reliable fallbacks for en + ta. */
+  getFallbackSummaries: (childData, iepPlan, evaluation) => {
+    const n = childData.childName, w = iepPlan?.weekNumber ?? 1, s = evaluation.score;
+    const adv = evaluation.aiDecision === "ADVANCE";
+    return {
+      en: `${n} completed Week ${w} with a score of ${s}/100. ${adv ? "Wonderful progress — moving to next week's plan!" : "Keep practising — the plan has been thoughtfully adapted for continued growth."}`,
+      ta: `${n} ${w}-வது வாரத்தை ${s}/100 மதிப்பெண்ணுடன் முடித்தார். ${adv ? "அருமையான முன்னேற்றம் — அடுத்த வார திட்டத்திற்கு நகர்கிறோம்!" : "தொடர்ந்து பயிற்சி செய்யுங்கள் — திட்டம் மாற்றி அமைக்கப்பட்டுள்ளது."}`,
+    };
+  },
+
+  getLangCode: (label) => SUPPORTED_LANGUAGES.find(l => l.label === label)?.code ?? "en",
+};
+
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 3 — MOCK DATABASE  (MongoDB-ready schemas)
+// ════════════════════════════════════════════════════════════════════════════════
 
 let mockDB = {
+  /**
+   * MongoDB: educators collection
+   * { _id, name, email, password, educatorType, assignedChildren[] }
+   */
   educators: [
-    { id: "edu1", name: "Dr. Priya Sharma", email: "priya@edu.com", password: "pass123", educatorType: "Autism", assignedChildren: ["par1"] },
-    { id: "edu2", name: "Mr. Rahul Verma", email: "rahul@edu.com", password: "pass123", educatorType: "ADHD", assignedChildren: ["par2"] },
-    { id: "edu3", name: "Ms. Anita Nair", email: "anita@edu.com", password: "pass123", educatorType: "Intellectual Disability", assignedChildren: [] },
-    { id: "edu4", name: "Dr. Sunita Patel", email: "sunita@edu.com", password: "pass123", educatorType: "Down Syndrome", assignedChildren: [] },
+    { id: "edu1", name: "Dr. Priya Sharma",  email: "priya@edu.com",  password: "pass123", educatorType: "Autism",                 assignedChildren: ["par1"] },
+    { id: "edu2", name: "Mr. Rahul Verma",   email: "rahul@edu.com",  password: "pass123", educatorType: "ADHD",                   assignedChildren: ["par2"] },
+    { id: "edu3", name: "Ms. Anita Nair",    email: "anita@edu.com",  password: "pass123", educatorType: "Intellectual Disability", assignedChildren: [] },
+    { id: "edu4", name: "Dr. Sunita Patel",  email: "sunita@edu.com", password: "pass123", educatorType: "Down Syndrome",          assignedChildren: [] },
   ],
+
+  /**
+   * MongoDB: users collection  (User Schema)
+   * {
+   *   _id, parentName, childName, age, disabilityType,
+   *   email, password,
+   *   preferredLanguage: "English" | "Tamil",   ← v4: only 2 options
+   *   uniqueChildID, assignedEducatorID,
+   *   isNewUser: Boolean,
+   *   initialAssessmentDone: Boolean,
+   *   gradeLevel: Number,                        ← computed from age
+   * }
+   */
   parents: [
-    { id: "par1", parentName: "Meera Krishnan", childName: "Arjun", age: 8, disabilityType: "Autism", email: "meera@parent.com", password: "pass123", preferredLanguage: "Tamil", uniqueChildID: "CHILD-001001", assignedEducatorID: "edu1", initialAssessmentDone: true },
-    { id: "par2", parentName: "Suresh Gupta", childName: "Riya", age: 10, disabilityType: "ADHD", email: "suresh@parent.com", password: "pass123", preferredLanguage: "Hindi", uniqueChildID: "CHILD-002002", assignedEducatorID: "edu2", initialAssessmentDone: false },
+    { id: "par1", parentName: "Meera Krishnan", childName: "Arjun", age: 8,  disabilityType: "Autism",                 email: "meera@parent.com",   password: "pass123", preferredLanguage: "Tamil",   uniqueChildID: "CHILD-001001", assignedEducatorID: "edu1", isNewUser: false, initialAssessmentDone: true,  gradeLevel: 4 },
+    { id: "par2", parentName: "Suresh Gupta",   childName: "Riya",  age: 10, disabilityType: "ADHD",                   email: "suresh@parent.com",  password: "pass123", preferredLanguage: "English", uniqueChildID: "CHILD-002002", assignedEducatorID: "edu2", isNewUser: false, initialAssessmentDone: false, gradeLevel: 6 },
+    { id: "par3", parentName: "Lakshmi Iyer",   childName: "Kiran", age: 7,  disabilityType: "Down Syndrome",          email: "lakshmi@parent.com", password: "pass123", preferredLanguage: "Tamil",   uniqueChildID: "CHILD-003003", assignedEducatorID: null,   isNewUser: true,  initialAssessmentDone: false, gradeLevel: 3 },
+    { id: "par4", parentName: "Anand Rajan",    childName: "Divya", age: 14, disabilityType: "Intellectual Disability", email: "anand@parent.com",   password: "pass123", preferredLanguage: "Tamil",   uniqueChildID: "CHILD-004004", assignedEducatorID: "edu3", isNewUser: false, initialAssessmentDone: true,  gradeLevel: 10 },
   ],
+
   assessments: [
     { id: "ass1", childID: "par1", educatorID: "edu1", testDetails: { communication: 40, motor: 55, cognitive: 35, social: 30, emotional: 45 }, score: 41, date: "2024-01-08", weekNumber: 1 },
     { id: "ass2", childID: "par1", educatorID: "edu1", testDetails: { communication: 50, motor: 60, cognitive: 45, social: 40, emotional: 50 }, score: 49, date: "2024-01-15", weekNumber: 2 },
     { id: "ass3", childID: "par1", educatorID: "edu1", testDetails: { communication: 60, motor: 65, cognitive: 55, social: 52, emotional: 58 }, score: 58, date: "2024-01-22", weekNumber: 3 },
     { id: "ass4", childID: "par2", educatorID: "edu2", testDetails: { communication: 65, motor: 70, cognitive: 60, social: 55, emotional: 50 }, score: 60, date: "2024-01-08", weekNumber: 1 },
   ],
+
   iepPlans: [
     {
       id: "iep1", childID: "par1", educatorID: "edu1",
       weeklyPlan: [
-        { day: "Monday", activity: "Picture card communication exercise", goal: "Identify 5 new objects", materials: "Picture cards, tablet" },
-        { day: "Tuesday", activity: "Fine motor bead threading", goal: "Thread 10 beads independently", materials: "Beads, string" },
-        { day: "Wednesday", activity: "Social story reading", goal: "Understand turn-taking", materials: "Social story book" },
-        { day: "Thursday", activity: "Sensory play - sand tray", goal: "Tolerate tactile input 10 min", materials: "Sand tray, toys" },
-        { day: "Friday", activity: "Peer interaction role play", goal: "Initiate 3 interactions", materials: "Role play props" },
+        { day: "Monday",    activity: "Picture card communication exercise", goal: "Identify 5 new objects",          materials: "Picture cards, tablet" },
+        { day: "Tuesday",   activity: "Fine motor bead threading",           goal: "Thread 10 beads independently",   materials: "Beads, string" },
+        { day: "Wednesday", activity: "Social story reading",                goal: "Understand turn-taking",          materials: "Social story book" },
+        { day: "Thursday",  activity: "Sensory play – sand tray",           goal: "Tolerate tactile input 10 min",   materials: "Sand tray, toys" },
+        { day: "Friday",    activity: "Peer interaction role play",          goal: "Initiate 3 interactions",         materials: "Role play props" },
       ],
       learningOutcome: "Improve communication and social initiation by 15%",
-      status: "Achieved", weekNumber: 1, aiGenerated: true, editedByEducator: true, previousScore: 41, targetScore: 55
-    },
-    {
-      id: "iep2", childID: "par1", educatorID: "edu1",
-      weeklyPlan: [
-        { day: "Monday", activity: "AAC device practice", goal: "Use 10 new AAC symbols", materials: "AAC device" },
-        { day: "Tuesday", activity: "Group motor activity", goal: "Participate 15 min", materials: "Ball, hoops" },
-        { day: "Wednesday", activity: "Emotion identification cards", goal: "Identify 6 emotions", materials: "Flashcards" },
-        { day: "Thursday", activity: "Cooking simple recipe", goal: "Follow 3-step instruction", materials: "Ingredients" },
-        { day: "Friday", activity: "Community outing prep", goal: "Practice safety rules", materials: "Visual rules card" },
-      ],
-      learningOutcome: "Build independence in daily communication and group participation",
-      status: "In Progress", weekNumber: 2, aiGenerated: true, editedByEducator: false, previousScore: 49, targetScore: 62
+      status: "Achieved", weekNumber: 1, aiGenerated: true, editedByEducator: true, previousScore: 41, targetScore: 55,
     },
   ],
+
   feedback: [
     { id: "fb1", parentID: "par1", educatorID: "edu1", childID: "par1", message: "Arjun has been using picture cards at home!", rating: 5, date: "2024-01-14", isRead: true },
     { id: "fb2", parentID: "par2", educatorID: "edu2", childID: "par2", message: "Riya is more focused now. Great techniques!", rating: 4, date: "2024-01-16", isRead: false },
   ],
 
-  // ── EXISTING V1 COLLECTIONS ─────────────────────────────────────────────────
   initialAssessments: [
     {
-      id: "ia1", childId: "par1",
-      totalScore: 41, level: "LOW",
-      disabilityType: "Autism", age: 8,
-      completedAt: "2024-01-07",
-      week1PlanGenerated: true,
+      id: "ia1", childId: "par1", totalScore: 41, level: "LOW",
+      disabilityType: "Autism", age: 8, completedAt: "2024-01-07", week1PlanGenerated: true,
       answers: [
-        { questionId: "q1", answer: "Sometimes", score: 1 },
-        { questionId: "q2", answer: "With help", score: 1 },
-        { questionId: "q3", answer: "Rarely", score: 0 },
+        { questionId: "q1", answer: "Sometimes",       score: 1 },
+        { questionId: "q2", answer: "With help",       score: 1 },
+        { questionId: "q3", answer: "Rarely",          score: 0 },
         { questionId: "q4", answer: "Needs prompting", score: 1 },
-        { questionId: "q5", answer: "No", score: 0 },
-      ]
-    }
+        { questionId: "q5", answer: "No",              score: 0 },
+      ],
+    },
   ],
+
   weeklyEvaluations: [],
 
-  // ── NEW V2 COLLECTIONS ──────────────────────────────────────────────────────
-
-  /**
-   * NEW: milestones collection
-   * MongoDB schema: /models/Milestone.js
-   * {
-   *   childId: ObjectId,
-   *   week: Number,
-   *   milestones: [{
-   *     title: String,
-   *     description: String,
-   *     status: "PENDING" | "COMPLETED"
-   *   }]
-   * }
-   */
   milestones: [
     {
       id: "ms1", childId: "par1", week: 1,
       milestones: [
-        { title: "Use picture cards to name 5 objects", description: "Child identifies objects using picture-to-object matching", status: "COMPLETED" },
-        { title: "Thread 10 beads independently", description: "Fine motor activity completed without adult hand-over-hand", status: "COMPLETED" },
-        { title: "Initiate 3 peer interactions", description: "Child begins play or conversation with a peer without prompting", status: "PENDING" },
-      ]
-    }
+        { title: "Use picture cards to name 5 objects",  description: "Child identifies objects via picture-to-object matching", status: "COMPLETED" },
+        { title: "Thread 10 beads independently",        description: "Fine motor activity without adult hand-over-hand",        status: "COMPLETED" },
+        { title: "Initiate 3 peer interactions",         description: "Child begins play without prompting",                     status: "PENDING" },
+      ],
+    },
   ],
 
   /**
-   * NEW: weeklySummaries collection
-   * MongoDB schema: /models/WeeklySummary.js
-   * {
-   *   childId: ObjectId,
-   *   week: Number,
-   *   summaryEnglish: String,
-   *   summaryRegional: String,
-   *   createdAt: Date
-   * }
+   * MongoDB: weeklySummaries collection
+   * v4 FIX: only "en" and "ta" keys are stored and displayed.
    */
   weeklySummaries: [
     {
       id: "ws1", childId: "par1", week: 1,
-      summaryEnglish: "Arjun had an excellent first week! He successfully completed picture card activities and made great progress in fine motor skills through bead threading. Communication using picture cards improved by 20%. Social initiation remains an area to work on, with peer interaction happening only when prompted.",
-      summaryRegional: "அர்ஜுன் முதல் வாரத்தில் சிறப்பாக செயல்பட்டான்! படம் பார்க்கும் செயல்பாடுகளில் வெற்றிகரமாக பங்கேற்றான். மணி கோர்க்கும் பயிற்சியில் நல்ல முன்னேற்றம் கண்டான். படங்களைப் பயன்படுத்தி தகவல் தொடர்பு 20% மேம்பட்டுள்ளது. சக மாணவர்களுடன் தொடர்பு இன்னும் மேம்படுத்தப்பட வேண்டும்.",
-      createdAt: "2024-01-14"
-    }
+      summaries: {
+        en: "Arjun had an excellent first week! He successfully completed picture card activities and made great progress in fine motor skills. Communication improved by 20%.",
+        ta: "அர்ஜுன் முதல் வாரத்தில் சிறப்பாக செயல்பட்டான்! படம் பார்க்கும் செயல்பாடுகளில் வெற்றிகரமாக பங்கேற்றான். தகவல் தொடர்பு 20% மேம்பட்டுள்ளது.",
+      },
+      createdAt: "2024-01-14",
+    },
+  ],
+
+  /**
+   * MongoDB: multiDomainAssessments collection  (Assessment Schema)
+   * POST /api/assessment
+   * {
+   *   _id, userId,
+   *   iqScore: Number (0–100),
+   *   cognitiveScore: Number (0–100),
+   *   motorScore: Number (0–100),
+   *   communicationScore: Number (0–100),
+   *   overallLevel: "LOW" | "MEDIUM" | "HIGH",
+   *   completedAt: Date,
+   * }
+   */
+  multiDomainAssessments: [
+    {
+      id: "mda1", userId: "par1",
+      iqScore: 42, cognitiveScore: 38, motorScore: 55, communicationScore: 35,
+      overallLevel: "LOW",
+      breakdown: {
+        iq:            { patternRecognition: 40, logicalReasoning: 45, memory: 40 },
+        cognitive:     { attentionSpan: 35, problemSolving: 38, followInstructions: 42 },
+        motor:         { fineMotor: 55, grossMotor: 55 },
+        communication: { speechClarity: 30, vocabulary: 38, languageUnderstanding: 38 },
+      },
+      completedAt: "2024-01-07",
+    },
+    {
+      id: "mda4", userId: "par4",
+      iqScore: 35, cognitiveScore: 30, motorScore: 45, communicationScore: 28,
+      overallLevel: "LOW",
+      breakdown: {
+        iq:            { patternRecognition: 30, logicalReasoning: 35, memory: 40 },
+        cognitive:     { attentionSpan: 28, problemSolving: 30, followInstructions: 32 },
+        motor:         { fineMotor: 45, grossMotor: 45 },
+        communication: { speechClarity: 25, vocabulary: 30, languageUnderstanding: 28 },
+      },
+      completedAt: "2024-01-07",
+    },
+  ],
+
+  /**
+   * MongoDB: educationPlans collection  (EducationPlan Schema)
+   * GET /api/education-plan/:userId
+   * {
+   *   _id, userId, gradeLevel, subjects[], goals{academic,functional},
+   *   recommendations[], accommodations[], generatedAt,
+   * }
+   */
+  educationPlans: [
+    {
+      id: "ep1", userId: "par1",
+      gradeLevel: 4, gradeLabel: "Grade 4", overallLevel: "LOW",
+      subjects: [
+        { name: "English",        icon: "📖", gradeGoal: "Essay writing, comprehension",   modifiedGoal: "Identify 10 sight words, form 3-word sentences with picture support" },
+        { name: "Mathematics",    icon: "🔢", gradeGoal: "Large numbers, geometry",        modifiedGoal: "Count objects up to 20, identify circles and squares with visual aids" },
+        { name: "Science",        icon: "🔬", gradeGoal: "Plants, animals, matter",        modifiedGoal: "Name 5 common animals, identify living vs non-living with real objects" },
+        { name: "Social Science", icon: "🌏", gradeGoal: "History, civics, geography",    modifiedGoal: "Identify family members, home, school on picture cards" },
+      ],
+      goals: {
+        academic:   ["Recognise and read 20 sight words independently", "Count and write numbers 1–20 with minimal support", "Identify 5 animals and their habitats using visual aids"],
+        functional: ["Follow 2-step verbal instructions in daily activities", "Communicate basic needs using picture cards or AAC", "Participate in 10-minute structured group activity"],
+      },
+      recommendations: ["Use visual schedules for all transitions", "Embed sensory breaks every 20 minutes", "Provide fidget tools during seated tasks", "Use positive reinforcement immediately after task completion"],
+      accommodations:  ["Extended time (2×) for all assessments", "Preferential seating near the teacher", "Modified worksheets with reduced items and larger font", "AAC device access at all times"],
+      generatedAt: "2024-01-08",
+    },
+    {
+      id: "ep4", userId: "par4",
+      gradeLevel: 10, gradeLabel: "Grade 10", overallLevel: "LOW",
+      subjects: [
+        { name: "Mathematics",    icon: "🔢", gradeGoal: "Real numbers, trigonometry",         modifiedGoal: "Count, add & subtract 2-digit numbers with number line support" },
+        { name: "Science",        icon: "🔬", gradeGoal: "Chemical reactions, electricity",     modifiedGoal: "Identify safe/unsafe materials; basic cause-effect in nature" },
+        { name: "English",        icon: "📖", gradeGoal: "Board-level writing, comprehension",  modifiedGoal: "Read simple passages, answer picture-based questions" },
+        { name: "Social Science", icon: "🌏", gradeGoal: "Nationalism, democracy",             modifiedGoal: "Know own address, name of state/country, basic civic rules" },
+      ],
+      goals: {
+        academic:   ["Recognise numbers 1–50 with visual supports", "Read and comprehend 2-sentence instructions", "Identify 5 everyday science concepts using concrete materials"],
+        functional: ["Follow a 4-step visual daily schedule independently", "Express preferences using a communication board", "Participate in age-appropriate group activities for 15 minutes"],
+      },
+      recommendations: ["High-interest, real-world materials tied to Grade 10 themes", "Peer buddy support for classroom participation", "Break complex tasks into single-step visual instructions"],
+      accommodations:  ["Oral assessment option for all subjects", "Extended time (3×) for all tasks", "Separate quiet room with minimal distractions", "Personal AAC/tablet with subject-specific vocabulary"],
+      generatedAt: "2024-01-08",
+    },
   ],
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SERVICE: aiService.js — Extended with NEW Claude API calls
-// ─────────────────────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 4 — AI SERVICE  (/services/aiService.js)
+// All Claude API calls. Modular — each function maps to one API operation.
+// ════════════════════════════════════════════════════════════════════════════════
+
+const _callClaude = async (prompt, maxTokens = 1200) => {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: maxTokens, messages: [{ role: "user", content: prompt }] }),
+  });
+  const data = await res.json();
+  const text = (data.content ?? []).map(b => b.text ?? "").join("");
+  return JSON.parse(text.replace(/```json|```/g, "").trim());
+};
 
 const aiService = {
 
-  // ── EXISTING METHODS (preserved) ──────────────────────────────────────────
+  // ── Initial 6-question assessment (legacy quick-start flow) ──────────────
 
   generateInitialTest: async (age, disabilityType) => {
-    const prompt = `You are a special education assessment expert. Generate an adaptive initial assessment for a child.
-Child Details: Age: ${age} years, Disability Type: ${disabilityType}
-Generate EXACTLY 6 questions. Assess: communication, motor skills, cognitive ability, social skills, emotional regulation, daily living.
-Return ONLY valid JSON:
-{"questions":[{"id":"q1","category":"communication","text":"Question?","options":["A","B","C","D"],"scoring":{"A":3,"B":2,"C":1,"D":0}}]}`;
-    try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000, messages: [{ role: "user", content: prompt }] })
-      });
-      const data = await res.json();
-      const text = data.content?.map(b => b.text || "").join("") || "";
-      return JSON.parse(text.replace(/```json|```/g, "").trim()).questions;
-    } catch { return aiService._fallbackInitialQuestions(age, disabilityType); }
+    const prompt = `Special education expert. Generate 6 parent-reported assessment questions for a ${age}-year-old child with ${disabilityType}. Categories: communication, motor, cognitive, social, emotional, daily living. Return ONLY valid JSON: {"questions":[{"id":"q1","category":"communication","text":"...","options":["A","B","C","D"],"scoring":{"A":3,"B":2,"C":1,"D":0}}]}`;
+    try { return (await _callClaude(prompt)).questions; }
+    catch { return aiService._fallbackInitialQuestions(age, disabilityType); }
   },
 
   evaluateInitialAssessment: (answers, questions) => {
-    const maxPerQ = 3;
-    const totalPossible = questions.length * maxPerQ;
-    const earned = answers.reduce((sum, a) => {
-      const q = questions.find(q => q.id === a.questionId);
-      return sum + (q?.scoring?.[a.answer] ?? a.score ?? 0);
-    }, 0);
+    const totalPossible = questions.length * 3;
+    const earned = answers.reduce((sum, a) => { const q = questions.find(q => q.id === a.questionId); return sum + (q?.scoring?.[a.answer] ?? a.score ?? 0); }, 0);
     const totalScore = Math.round((earned / totalPossible) * 100);
-    const level = totalScore < 40 ? "LOW" : totalScore < 70 ? "MEDIUM" : "HIGH";
-    return { totalScore, level };
+    return { totalScore, level: totalScore < 40 ? "LOW" : totalScore < 70 ? "MEDIUM" : "HIGH" };
   },
+
+  // ── Week 1 plan generation ─────────────────────────────────────────────────
 
   generateWeek1Plan: async (childData, score, level) => {
-    const prompt = `You are a special education curriculum designer. Generate a detailed Week 1 learning plan.
-Child: ${childData.childName}, Age ${childData.age}, ${childData.disabilityType}, Score: ${score}/100, Level: ${level}
-Return ONLY valid JSON:
-{"weeklyPlan":[{"day":"Monday","activity":"...","goal":"...","materials":"...","duration":"30 min"},{"day":"Tuesday","activity":"...","goal":"...","materials":"...","duration":"30 min"},{"day":"Wednesday","activity":"...","goal":"...","materials":"...","duration":"30 min"},{"day":"Thursday","activity":"...","goal":"...","materials":"...","duration":"30 min"},{"day":"Friday","activity":"...","goal":"...","materials":"...","duration":"30 min"}],
-"learningOutcome":"...","expectedOutcomes":["..."],"strategies":["..."],"parentTips":["..."],"targetScore":${Math.min(score + 15, 100)}}`;
-    try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000, messages: [{ role: "user", content: prompt }] })
-      });
-      const data = await res.json();
-      const text = data.content?.map(b => b.text || "").join("") || "";
-      return JSON.parse(text.replace(/```json|```/g, "").trim());
-    } catch { return aiService._fallbackWeek1Plan(childData, score, level); }
+    const grade = curriculumEngine.getGradeFromAge(childData.age);
+    const gradeInfo = curriculumEngine.getSubjectsForGrade(grade);
+    const prompt = `Special education curriculum designer. Generate Week 1 learning plan.
+Child: ${childData.childName}, Age ${childData.age}, ${childData.disabilityType}, Score: ${score}/100, Level: ${level}, ${gradeInfo.label}
+Grade subjects: ${gradeInfo.subjects.map(s => s.name).join(", ")}
+Return ONLY valid JSON: {"weeklyPlan":[{"day":"Monday","activity":"...","goal":"...","materials":"...","duration":"30 min"},{"day":"Tuesday","activity":"...","goal":"...","materials":"...","duration":"30 min"},{"day":"Wednesday","activity":"...","goal":"...","materials":"...","duration":"30 min"},{"day":"Thursday","activity":"...","goal":"...","materials":"...","duration":"30 min"},{"day":"Friday","activity":"...","goal":"...","materials":"...","duration":"30 min"}],"learningOutcome":"...","expectedOutcomes":["..."],"strategies":["..."],"parentTips":["..."],"targetScore":${Math.min(score + 15, 100)}}`;
+    try { return await _callClaude(prompt); }
+    catch { return aiService._fallbackWeek1Plan(childData, score, level); }
   },
 
+  // ── Weekly evaluation questions ────────────────────────────────────────────
+
   generateWeeklyEvalTest: async (iepPlan, childData) => {
-    const activitiesSummary = iepPlan.weeklyPlan.map(d => `${d.day}: ${d.activity} (Goal: ${d.goal})`).join("\n");
-    const prompt = `Generate a 5-question end-of-week evaluation for a child.
-Child: ${childData.childName}, Age ${childData.age}, ${childData.disabilityType}
-Week ${iepPlan.weekNumber} Activities:\n${activitiesSummary}
-Goal: ${iepPlan.learningOutcome}
-Return ONLY valid JSON:
-{"questions":[{"id":"eq1","category":"goal_achievement","text":"...","options":["Always (4+ times)","Often (2-3 times)","Sometimes (1 time)","Not yet"],"scoring":{"Always (4+ times)":3,"Often (2-3 times)":2,"Sometimes (1 time)":1,"Not yet":0},"relatedActivity":"Monday"}]}`;
-    try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 800, messages: [{ role: "user", content: prompt }] })
-      });
-      const data = await res.json();
-      const text = data.content?.map(b => b.text || "").join("") || "";
-      return JSON.parse(text.replace(/```json|```/g, "").trim()).questions;
-    } catch { return aiService._fallbackEvalQuestions(iepPlan); }
+    const acts = iepPlan.weeklyPlan.map(d => `${d.day}: ${d.activity} (Goal: ${d.goal})`).join("\n");
+    const prompt = `Generate 5-question end-of-week evaluation. Child: ${childData.childName}, Age ${childData.age}, ${childData.disabilityType}. Week ${iepPlan.weekNumber} Activities:\n${acts}\nReturn ONLY valid JSON: {"questions":[{"id":"eq1","category":"goal_achievement","text":"...","options":["Always (4+ times)","Often (2-3 times)","Sometimes (1 time)","Not yet"],"scoring":{"Always (4+ times)":3,"Often (2-3 times)":2,"Sometimes (1 time)":1,"Not yet":0},"relatedActivity":"Monday"}]}`;
+    try { return (await _callClaude(prompt, 800)).questions; }
+    catch { return aiService._fallbackEvalQuestions(iepPlan); }
   },
+
+  // ── ADVANCE / MODIFY decision ─────────────────────────────────────────────
 
   makeProgressDecision: async (score, targetScore, previousScore, iepPlan, childData) => {
     const achieved = score >= targetScore;
-    const improvement = score - previousScore;
-    const prompt = `Special education AI advisor. Make a data-driven decision.
-Child: ${childData.childName}, ${childData.disabilityType}, Age ${childData.age}
-Previous Score: ${previousScore}/100, This Week: ${score}/100, Target: ${targetScore}/100
-Improvement: ${improvement >= 0 ? "+" : ""}${improvement}, Goal: ${achieved ? "ACHIEVED ✅" : "NOT ACHIEVED ❌"}
-Plan Goal: ${iepPlan.learningOutcome}
-Rules: score >= targetScore → ADVANCE; score < targetScore → MODIFY
-Return ONLY valid JSON:
-{"decision":"ADVANCE","reasoning":"...","modifications":[],"nextWeekHints":["..."],"encouragementMessage":"..."}`;
-    try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 600, messages: [{ role: "user", content: prompt }] })
-      });
-      const data = await res.json();
-      const text = data.content?.map(b => b.text || "").join("") || "";
-      return JSON.parse(text.replace(/```json|```/g, "").trim());
-    } catch {
+    const prompt = `Special education AI. Decision: Child ${childData.childName}, ${childData.disabilityType}, Age ${childData.age}. Score: ${score}/100, Target: ${targetScore}/100, Previous: ${previousScore}/100. Goal: ${iepPlan.learningOutcome}. ADVANCE if score>=target, MODIFY if below. Return ONLY JSON: {"decision":"ADVANCE","reasoning":"...","modifications":[],"nextWeekHints":["..."],"encouragementMessage":"..."}`;
+    try { return await _callClaude(prompt, 600); }
+    catch {
       return {
         decision: achieved ? "ADVANCE" : "MODIFY",
-        reasoning: achieved ? `${childData.childName} achieved target ${targetScore}. Progressing to next week.` : `${childData.childName} scored ${score} vs target ${targetScore}. Plan will be adapted.`,
-        modifications: achieved ? [] : ["Reduce activity complexity by 20%", "Add more repetition and reinforcement", "Introduce visual supports for difficult tasks"],
-        nextWeekHints: achieved ? ["Build on this week's successes", "Introduce slightly more complex interactions"] : [],
-        encouragementMessage: achieved ? `Wonderful progress! ${childData.childName} is ready for the next challenge.` : `Every step counts! ${childData.childName} is working hard — keep going!`
+        reasoning: achieved ? `${childData.childName} achieved target ${targetScore}. Moving to next week.` : `${childData.childName} scored ${score} vs target ${targetScore}. Plan will be adapted.`,
+        modifications: achieved ? [] : ["Reduce complexity by 20%", "Add more repetition", "Introduce visual supports"],
+        nextWeekHints: achieved ? ["Build on successes", "Introduce slightly more complexity"] : [],
+        encouragementMessage: achieved ? `Wonderful progress! ${childData.childName} is ready for the next challenge.` : `Every step counts! ${childData.childName} is working hard — keep going!`,
       };
     }
   },
+
+  // ── Next-week plan generation ─────────────────────────────────────────────
 
   generateNextWeekPlan: async (childData, currentPlan, evaluation) => {
-    const prompt = `Special education curriculum designer. Generate Week ${currentPlan.weekNumber + 1} progression plan.
-Child: ${childData.childName}, Age ${childData.age}, ${childData.disabilityType}
-Completed Week ${currentPlan.weekNumber} — Score: ${evaluation.score}/100 ✅
-Previous Goal: ${currentPlan.learningOutcome}
-Return ONLY valid JSON:
-{"weeklyPlan":[{"day":"Monday","activity":"...","goal":"...","materials":"...","duration":"30 min"},{"day":"Tuesday","activity":"...","goal":"...","materials":"...","duration":"30 min"},{"day":"Wednesday","activity":"...","goal":"...","materials":"...","duration":"30 min"},{"day":"Thursday","activity":"...","goal":"...","materials":"...","duration":"30 min"},{"day":"Friday","activity":"...","goal":"...","materials":"...","duration":"30 min"}],
-"learningOutcome":"...","expectedOutcomes":["..."],"strategies":["..."],"parentTips":["..."],"targetScore":${Math.min(evaluation.score + 12, 100)}}`;
-    try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000, messages: [{ role: "user", content: prompt }] })
-      });
-      const data = await res.json();
-      const text = data.content?.map(b => b.text || "").join("") || "";
-      return JSON.parse(text.replace(/```json|```/g, "").trim());
-    } catch { return aiService._fallbackWeek1Plan(childData, evaluation.score, evaluation.score >= 70 ? "HIGH" : "MEDIUM"); }
+    const gradeInfo = curriculumEngine.getSubjectsForGrade(curriculumEngine.getGradeFromAge(childData.age));
+    const prompt = `Special education curriculum. Week ${currentPlan.weekNumber + 1} plan for ${childData.childName}, Age ${childData.age}, ${childData.disabilityType}, ${gradeInfo.label}. Previous score: ${evaluation.score}/100. Return ONLY valid JSON: {"weeklyPlan":[{"day":"Monday","activity":"...","goal":"...","materials":"...","duration":"30 min"},{"day":"Tuesday","activity":"...","goal":"...","materials":"...","duration":"30 min"},{"day":"Wednesday","activity":"...","goal":"...","materials":"...","duration":"30 min"},{"day":"Thursday","activity":"...","goal":"...","materials":"...","duration":"30 min"},{"day":"Friday","activity":"...","goal":"...","materials":"...","duration":"30 min"}],"learningOutcome":"...","expectedOutcomes":["..."],"strategies":["..."],"parentTips":["..."],"targetScore":${Math.min(evaluation.score + 12, 100)}}`;
+    try { return await _callClaude(prompt); }
+    catch { return aiService._fallbackWeek1Plan(childData, evaluation.score, evaluation.score >= 70 ? "HIGH" : "MEDIUM"); }
   },
 
-  // ── NEW V2 METHODS ────────────────────────────────────────────────────────
+  // ── Milestone generation ──────────────────────────────────────────────────
 
-  /**
-   * Feature 1: Generate 2–5 milestones for a given week plan
-   * Called when a new IEP plan is created.
-   * @param {object} iepPlan - the week's plan
-   * @param {object} childData
-   * @returns {Array} milestones [{title, description, status:"PENDING"}]
-   */
   generateMilestones: async (iepPlan, childData) => {
-    const activitiesSummary = iepPlan.weeklyPlan.map(d => `${d.day}: ${d.goal}`).join("; ");
-    const prompt = `You are a special education milestone expert. Define 3–5 measurable milestones for this week's learning plan.
-
-Child: ${childData.childName}, Age ${childData.age}, ${childData.disabilityType}
-Week ${iepPlan.weekNumber} Goals: ${activitiesSummary}
-Overall Goal: ${iepPlan.learningOutcome}
-
-Create SPECIFIC, OBSERVABLE milestones a parent can track at home.
-
-Return ONLY valid JSON:
-{
-  "milestones": [
-    {
-      "title": "Short observable milestone title",
-      "description": "Specific observable behavior to check off"
-    }
-  ]
-}`;
+    const prompt = `Special education milestones. Define 3–5 observable milestones for week ${iepPlan.weekNumber}. Child: ${childData.childName}, ${childData.disabilityType}. Goals: ${iepPlan.weeklyPlan.map(d => d.goal).join("; ")}. Return ONLY JSON: {"milestones":[{"title":"...","description":"..."}]}`;
     try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 600, messages: [{ role: "user", content: prompt }] })
-      });
-      const data = await res.json();
-      const text = data.content?.map(b => b.text || "").join("") || "";
-      const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+      const parsed = await _callClaude(prompt, 600);
       return parsed.milestones.map(m => ({ ...m, status: "PENDING" }));
     } catch {
-      // Fallback milestones from plan goals
-      return iepPlan.weeklyPlan.slice(0, 3).map((day, i) => ({
-        title: day.goal,
-        description: `Complete the ${day.day} activity: ${day.activity}`,
-        status: "PENDING"
-      }));
+      return iepPlan.weeklyPlan.slice(0, 3).map(day => ({ title: day.goal, description: `Complete: ${day.activity}`, status: "PENDING" }));
     }
+  },
+
+  // ── v4: Weekly summary in EN + TA only (language bug fix) ────────────────
+
+  generateSummary: async (childData, iepPlan, evaluation) => {
+    const prompt = languageEngine.buildSummaryPrompt(childData, iepPlan, evaluation);
+    try { return await _callClaude(prompt); }
+    catch { return languageEngine.getFallbackSummaries(childData, iepPlan, evaluation); }
+  },
+
+  // ── v4: Multi-domain assessment question generation ───────────────────────
+  /**
+   * POST /api/assessment — generates the 4-domain question set for the
+   * new-user assessment flow.
+   * Domains: IQ (patternRecognition, logicalReasoning, memory)
+   *          Cognitive (attentionSpan, problemSolving, followInstructions)
+   *          Motor (fineMotor, grossMotor — slider type)
+   *          Communication (speechClarity, vocabulary, languageUnderstanding)
+   */
+  generateMultiDomainTest: async (age, disabilityType) => {
+    const prompt = `You are a special education assessment expert.
+Generate a comprehensive multi-domain assessment for a ${age}-year-old child with ${disabilityType}.
+
+Domains and sub-skills:
+1. IQ: patternRecognition, logicalReasoning, memory  → MCQ (options map to 3/2/1/0)
+2. Cognitive: attentionSpan, problemSolving, followInstructions  → MCQ
+3. Motor: fineMotor, grossMotor  → slider (parent rates 0–100)
+4. Communication: speechClarity, vocabulary, languageUnderstanding  → MCQ
+
+Make questions parent-reportable (observable at home). Keep language simple.
+Return ONLY valid JSON:
+{
+  "domains": {
+    "iq":            { "label": "IQ & Reasoning",  "icon": "🧠", "questions": [{"id":"iq1","sub":"patternRecognition","type":"mcq","text":"...","options":["...","...","...","..."],"scoring":{"option_text":3,...}},...] },
+    "cognitive":     { "label": "Cognitive Skills", "icon": "💡", "questions": [{"id":"cg1",...},...] },
+    "motor":         { "label": "Motor Skills",     "icon": "✋", "questions": [{"id":"mt1","sub":"fineMotor","type":"slider","text":"Rate your child's fine motor ability (writing, drawing, using utensils)","min":0,"max":100},{"id":"mt2","sub":"grossMotor","type":"slider","text":"Rate your child's gross motor ability (running, jumping, coordination)","min":0,"max":100}] },
+    "communication": { "label": "Communication",    "icon": "💬", "questions": [{"id":"cm1",...},...] }
+  }
+}`;
+    try { return (await _callClaude(prompt, 2000)).domains; }
+    catch { return aiService._fallbackMultiDomainTest(age, disabilityType); }
   },
 
   /**
-   * Feature 3: Generate weekly learning summary in English, then translate to Tamil
-   * Called after weekly evaluation is completed.
-   * @param {object} childData
-   * @param {object} iepPlan - the week's plan
-   * @param {object} evaluation - score, improvement, aiDecision
-   * @returns {{ summaryEnglish, summaryRegional }}
+   * Calculates domain scores and overall level from assessment answers.
+   * Mirrors POST /api/assessment server-side logic.
    */
-  generateWeeklySummary: async (childData, iepPlan, evaluation) => {
-    const prompt = `You are a special education summary writer.
+  evaluateMultiDomainAssessment: (answers, domains) => {
+    const domainScores = {};
+    let totalPoints = 0, totalMax = 0;
+    Object.entries(domains).forEach(([key, domain]) => {
+      let dp = 0, dm = 0;
+      domain.questions.forEach(q => {
+        if (q.type === "slider") { dp += (answers[q.id] ?? 50); dm += 100; }
+        else { dp += (q.scoring?.[answers[q.id]] ?? 0); dm += 3; }
+      });
+      domainScores[key] = Math.round((dp / dm) * 100);
+      totalPoints += dp; totalMax += dm;
+    });
+    const overallScore = Math.round((totalPoints / totalMax) * 100);
+    return { domainScores, overallScore, overallLevel: overallScore < 40 ? "LOW" : overallScore < 70 ? "MEDIUM" : "HIGH" };
+  },
 
-Generate a weekly learning summary AND translate it to Tamil (தமிழ்).
+  /**
+   * Generates the full IEP from multi-domain results.
+   * GET /api/education-plan/:userId server-side IEP generation logic.
+   */
+  generateIEP: async (childData, multiDomainResult) => {
+    const grade = curriculumEngine.getGradeFromAge(childData.age);
+    const gradeInfo = curriculumEngine.getSubjectsForGrade(grade);
+    const { domainScores, overallScore, overallLevel } = multiDomainResult;
+
+    const prompt = `You are an IEP (Individualized Education Plan) specialist.
+Generate a comprehensive, grade-aligned IEP.
 
 Child: ${childData.childName}, Age ${childData.age}, ${childData.disabilityType}
-Week ${iepPlan.weekNumber}
-Score: ${evaluation.score}/100 (Previous: ${evaluation.previousScore}/100)
-Improvement: ${evaluation.improvement >= 0 ? "+" : ""}${evaluation.improvement}
-AI Decision: ${evaluation.aiDecision}
-Weekly Goal: ${iepPlan.learningOutcome}
+Grade: ${gradeInfo.label}
+Assessment Results:
+- IQ Score: ${domainScores.iq ?? 50}/100
+- Cognitive Score: ${domainScores.cognitive ?? 50}/100
+- Motor Score: ${domainScores.motor ?? 50}/100
+- Communication Score: ${domainScores.communication ?? 50}/100
+- Overall Level: ${overallLevel}
 
-Write in a warm, encouraging tone for the parent.
-The English summary should be 3-4 sentences: learning recap, performance, suggestion.
-The Tamil translation should be natural and fluent, not literal.
+${gradeInfo.label} subjects: ${gradeInfo.subjects.map(s => `${s.name} (${s.focus})`).join("; ")}
+
+Requirements:
+1. Modified subject goals — grade-level content adapted to ${overallLevel} ability
+2. 3 academic goals + 3 functional goals
+3. 4 teaching recommendations
+4. 4 classroom accommodations
 
 Return ONLY valid JSON:
 {
-  "summaryEnglish": "3-4 sentences in English covering learning, performance, suggestions...",
-  "summaryTamil": "Same content naturally translated into Tamil script..."
+  "subjects": [{"name":"...","icon":"emoji","gradeGoal":"...","modifiedGoal":"..."}],
+  "goals": {"academic":["...","...","..."],"functional":["...","...","..."]},
+  "recommendations": ["...","...","...","..."],
+  "accommodations":  ["...","...","...","..."]
 }`;
     try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 800, messages: [{ role: "user", content: prompt }] })
-      });
-      const data = await res.json();
-      const text = data.content?.map(b => b.text || "").join("") || "";
-      const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
-      return { summaryEnglish: parsed.summaryEnglish, summaryRegional: parsed.summaryTamil };
+      const parsed = await _callClaude(prompt, 1500);
+      return { gradeLevel: grade, gradeLabel: gradeInfo.label, overallLevel, overallScore, ...parsed, generatedAt: new Date().toISOString() };
     } catch {
-      const decision = evaluation.aiDecision === "ADVANCE" ? "progressed to the next level" : "is continuing to work on this week's goals with an adapted plan";
-      return {
-        summaryEnglish: `${childData.childName} completed Week ${iepPlan.weekNumber} with a score of ${evaluation.score}/100. This week focused on ${iepPlan.learningOutcome}. ${evaluation.improvement >= 0 ? `There was a ${evaluation.improvement}-point improvement from last week.` : "We will continue to build on foundational skills."} ${childData.childName} has ${decision}.`,
-        summaryRegional: `${childData.childName} ${iepPlan.weekNumber}-வது வாரத்தை ${evaluation.score}/100 மதிப்பெண்ணுடன் முடித்தார். இந்த வாரம் ${iepPlan.learningOutcome} என்பதில் கவனம் செலுத்தியது. ${evaluation.improvement >= 0 ? `கடந்த வாரத்திலிருந்து ${evaluation.improvement} மதிப்பெண் முன்னேற்றம் கண்டுள்ளது.` : "அடிப்படை திறன்களை மேலும் வளர்க்கவோம்."} ${childData.childName} ${decision === "progressed to the next level" ? "அடுத்த கட்டத்திற்கு முன்னேறினார்" : "தகவமைக்கப்பட்ட திட்டத்தில் தொடர்கிறார்"}.`
-      };
+      return aiService._fallbackIEP(childData, grade, gradeInfo, overallLevel, domainScores);
     }
   },
 
-  // ── PRIVATE FALLBACKS (preserved from v1) ─────────────────────────────────
+  // ── Fallbacks ──────────────────────────────────────────────────────────────
+
+  _fallbackMultiDomainTest: (age, disabilityType) => ({
+    iq: {
+      label: "IQ & Reasoning", icon: "🧠",
+      questions: [
+        { id: "iq1", sub: "patternRecognition", type: "mcq", text: "Can your child complete a simple 4-piece puzzle without help?", options: ["Yes, easily", "With some help", "With a lot of help", "Not yet"], scoring: { "Yes, easily": 3, "With some help": 2, "With a lot of help": 1, "Not yet": 0 } },
+        { id: "iq2", sub: "logicalReasoning",   type: "mcq", text: "Can your child sort objects by colour or shape?",              options: ["Always independently", "Usually", "Sometimes", "Not yet"], scoring: { "Always independently": 3, "Usually": 2, "Sometimes": 1, "Not yet": 0 } },
+        { id: "iq3", sub: "memory",             type: "mcq", text: "Can your child remember a simple 2-step instruction?",          options: ["Yes, reliably", "Usually", "With reminders", "No"], scoring: { "Yes, reliably": 3, "Usually": 2, "With reminders": 1, "No": 0 } },
+      ],
+    },
+    cognitive: {
+      label: "Cognitive Skills", icon: "💡",
+      questions: [
+        { id: "cg1", sub: "attentionSpan",       type: "mcq", text: "How long can your child focus on a preferred activity?",           options: ["15+ minutes", "10–15 minutes", "5–10 minutes", "Under 5 minutes"], scoring: { "15+ minutes": 3, "10–15 minutes": 2, "5–10 minutes": 1, "Under 5 minutes": 0 } },
+        { id: "cg2", sub: "problemSolving",      type: "mcq", text: "When a toy stops working, what does your child do?",              options: ["Tries to fix it", "Asks for help", "Gets upset then asks", "Gives up immediately"], scoring: { "Tries to fix it": 3, "Asks for help": 2, "Gets upset then asks": 1, "Gives up immediately": 0 } },
+        { id: "cg3", sub: "followInstructions",  type: "mcq", text: "How well does your child follow classroom/group instructions?",    options: ["Very well", "Mostly well", "With individual support", "Needs constant prompting"], scoring: { "Very well": 3, "Mostly well": 2, "With individual support": 1, "Needs constant prompting": 0 } },
+      ],
+    },
+    motor: {
+      label: "Motor Skills", icon: "✋",
+      questions: [
+        { id: "mt1", sub: "fineMotor",  type: "slider", text: "Rate your child's fine motor ability (writing, drawing, using cutlery, buttons)", min: 0, max: 100 },
+        { id: "mt2", sub: "grossMotor", type: "slider", text: "Rate your child's gross motor ability (running, jumping, climbing, coordination)", min: 0, max: 100 },
+      ],
+    },
+    communication: {
+      label: "Communication", icon: "💬",
+      questions: [
+        { id: "cm1", sub: "speechClarity",         type: "mcq", text: "How clearly does your child speak?",                   options: ["Very clearly", "Mostly clear", "Sometimes unclear", "Difficult to understand"], scoring: { "Very clearly": 3, "Mostly clear": 2, "Sometimes unclear": 1, "Difficult to understand": 0 } },
+        { id: "cm2", sub: "vocabulary",            type: "mcq", text: "How large is your child's working vocabulary?",        options: ["Age-appropriate", "Slightly limited", "Significantly limited", "Very few words"], scoring: { "Age-appropriate": 3, "Slightly limited": 2, "Significantly limited": 1, "Very few words": 0 } },
+        { id: "cm3", sub: "languageUnderstanding", type: "mcq", text: "Does your child understand what is said to them?",      options: ["Fully", "Mostly", "Partially", "Rarely"], scoring: { "Fully": 3, "Mostly": 2, "Partially": 1, "Rarely": 0 } },
+      ],
+    },
+  }),
+
+  _fallbackIEP: (childData, grade, gradeInfo, overallLevel, domainScores) => ({
+    gradeLevel: grade, gradeLabel: gradeInfo.label, overallLevel,
+    subjects: gradeInfo.subjects.map(s => ({
+      name: s.name, icon: s.icon, gradeGoal: s.focus,
+      modifiedGoal: overallLevel === "LOW"
+        ? `With picture support and 1:1 assistance, begin foundational ${s.name.toLowerCase()} concepts`
+        : overallLevel === "MEDIUM"
+        ? `With modified materials, work toward simplified ${s.name.toLowerCase()} activities`
+        : `With minor support, engage with grade-level ${s.name.toLowerCase()} content`,
+    })),
+    goals: {
+      academic:   [`Demonstrate foundational ${gradeInfo.subjects[0]?.name} skills with ${overallLevel === "LOW" ? "maximum" : "moderate"} support`, `Complete structured ${gradeInfo.subjects[1]?.name} activities for 10–15 minutes`, `Respond to ${overallLevel === "LOW" ? "1-step" : "2-step"} instructions in academic tasks`],
+      functional: ["Follow classroom routine independently using visual schedule", "Communicate basic needs appropriately", "Participate in group activities for 10 minutes"],
+    },
+    recommendations: ["Use visual schedules and daily routines", "Embed multi-sensory learning activities", "Provide frequent positive reinforcement", "Collaborate with parents on home generalisation activities"],
+    accommodations:  ["Extended time for all tasks and assessments", "Modified worksheets with reduced items", "Preferential seating near the educator", "Assistive technology access as needed"],
+  }),
 
   _fallbackInitialQuestions: (age, disabilityType) => {
     const base = {
       Autism: [
-        { id: "q1", category: "communication", text: "Does your child make eye contact during conversation?", options: ["Consistently", "Sometimes", "Rarely", "Never"], scoring: { "Consistently": 3, "Sometimes": 2, "Rarely": 1, "Never": 0 } },
-        { id: "q2", category: "social", text: "Does your child initiate play with other children?", options: ["Often", "Sometimes", "With prompting", "Not yet"], scoring: { "Often": 3, "Sometimes": 2, "With prompting": 1, "Not yet": 0 } },
-        { id: "q3", category: "communication", text: "How does your child communicate needs?", options: ["Full sentences", "Single words", "Gestures/pointing", "Crying/behavior"], scoring: { "Full sentences": 3, "Single words": 2, "Gestures/pointing": 1, "Crying/behavior": 0 } },
-        { id: "q4", category: "cognitive", text: "Can your child follow a 2-step instruction?", options: ["Easily", "With reminders", "With help", "Not yet"], scoring: { "Easily": 3, "With reminders": 2, "With help": 1, "Not yet": 0 } },
-        { id: "q5", category: "emotional", text: "How does your child handle changes in routine?", options: ["Adapts well", "Minor upset", "Significant distress", "Complete meltdown"], scoring: { "Adapts well": 3, "Minor upset": 2, "Significant distress": 1, "Complete meltdown": 0 } },
-        { id: "q6", category: "motor", text: "Can your child use utensils independently?", options: ["Yes, independently", "With minor spills", "Needs help", "Cannot yet"], scoring: { "Yes, independently": 3, "With minor spills": 2, "Needs help": 1, "Cannot yet": 0 } },
+        { id: "q1", category: "communication", text: "Does your child make eye contact during conversation?",            options: ["Consistently", "Sometimes", "Rarely", "Never"],         scoring: { "Consistently": 3, "Sometimes": 2, "Rarely": 1, "Never": 0 } },
+        { id: "q2", category: "social",        text: "Does your child initiate play with other children?",              options: ["Often", "Sometimes", "With prompting", "Not yet"],      scoring: { "Often": 3, "Sometimes": 2, "With prompting": 1, "Not yet": 0 } },
+        { id: "q3", category: "communication", text: "How does your child communicate needs?",                          options: ["Full sentences", "Single words", "Gestures/pointing", "Crying/behavior"], scoring: { "Full sentences": 3, "Single words": 2, "Gestures/pointing": 1, "Crying/behavior": 0 } },
+        { id: "q4", category: "cognitive",     text: "Can your child follow a 2-step instruction?",                    options: ["Easily", "With reminders", "With help", "Not yet"],     scoring: { "Easily": 3, "With reminders": 2, "With help": 1, "Not yet": 0 } },
+        { id: "q5", category: "emotional",     text: "How does your child handle changes in routine?",                 options: ["Adapts well", "Minor upset", "Significant distress", "Complete meltdown"], scoring: { "Adapts well": 3, "Minor upset": 2, "Significant distress": 1, "Complete meltdown": 0 } },
+        { id: "q6", category: "motor",         text: "Can your child use utensils independently?",                     options: ["Yes, independently", "With minor spills", "Needs help", "Cannot yet"], scoring: { "Yes, independently": 3, "With minor spills": 2, "Needs help": 1, "Cannot yet": 0 } },
       ],
       ADHD: [
-        { id: "q1", category: "attention", text: "How long can your child focus on a preferred activity?", options: ["20+ minutes", "10-20 minutes", "5-10 minutes", "Under 5 minutes"], scoring: { "20+ minutes": 3, "10-20 minutes": 2, "5-10 minutes": 1, "Under 5 minutes": 0 } },
-        { id: "q2", category: "impulse", text: "Does your child wait for their turn in games or conversations?", options: ["Usually", "Sometimes", "Rarely", "Never"], scoring: { "Usually": 3, "Sometimes": 2, "Rarely": 1, "Never": 0 } },
-        { id: "q3", category: "hyperactivity", text: "How often does your child leave their seat when expected to stay?", options: ["Rarely", "Occasionally", "Frequently", "Almost always"], scoring: { "Rarely": 3, "Occasionally": 2, "Frequently": 1, "Almost always": 0 } },
-        { id: "q4", category: "organization", text: "Can your child keep track of their belongings?", options: ["Always", "Usually", "Sometimes", "Never"], scoring: { "Always": 3, "Usually": 2, "Sometimes": 1, "Never": 0 } },
-        { id: "q5", category: "following", text: "Does your child complete multi-step tasks independently?", options: ["Yes easily", "With reminders", "Partially", "Not yet"], scoring: { "Yes easily": 3, "With reminders": 2, "Partially": 1, "Not yet": 0 } },
-        { id: "q6", category: "emotional", text: "How does your child react to frustration?", options: ["Manages calmly", "Brief upset", "Prolonged distress", "Aggressive behavior"], scoring: { "Manages calmly": 3, "Brief upset": 2, "Prolonged distress": 1, "Aggressive behavior": 0 } },
+        { id: "q1", category: "attention",  text: "How long can your child focus on a preferred activity?",           options: ["20+ minutes", "10–20 minutes", "5–10 minutes", "Under 5 minutes"], scoring: { "20+ minutes": 3, "10–20 minutes": 2, "5–10 minutes": 1, "Under 5 minutes": 0 } },
+        { id: "q2", category: "impulse",    text: "Does your child wait for their turn in games?",                    options: ["Usually", "Sometimes", "Rarely", "Never"],               scoring: { "Usually": 3, "Sometimes": 2, "Rarely": 1, "Never": 0 } },
+        { id: "q3", category: "hyperact",   text: "How often does your child leave their seat unexpectedly?",         options: ["Rarely", "Occasionally", "Frequently", "Almost always"], scoring: { "Rarely": 3, "Occasionally": 2, "Frequently": 1, "Almost always": 0 } },
+        { id: "q4", category: "organise",   text: "Can your child keep track of belongings?",                         options: ["Always", "Usually", "Sometimes", "Never"],               scoring: { "Always": 3, "Usually": 2, "Sometimes": 1, "Never": 0 } },
+        { id: "q5", category: "following",  text: "Does your child complete multi-step tasks independently?",         options: ["Yes easily", "With reminders", "Partially", "Not yet"], scoring: { "Yes easily": 3, "With reminders": 2, "Partially": 1, "Not yet": 0 } },
+        { id: "q6", category: "emotional",  text: "How does your child react to frustration?",                        options: ["Manages calmly", "Brief upset", "Prolonged distress", "Aggressive behavior"], scoring: { "Manages calmly": 3, "Brief upset": 2, "Prolonged distress": 1, "Aggressive behavior": 0 } },
       ],
     };
-    return base[disabilityType] || base["Autism"];
+    return base[disabilityType] ?? base["Autism"];
   },
 
   _fallbackWeek1Plan: (childData, score, level) => {
     const plans = {
-      LOW: {
-        weeklyPlan: [
-          { day: "Monday", activity: "Structured sensory exploration with familiar objects", goal: "Engage with 3 different textures", materials: "Texture board, safe household objects", duration: "20 min" },
-          { day: "Tuesday", activity: "Picture-to-object matching exercise", goal: "Match 5 picture cards to real objects", materials: "Picture cards, everyday objects", duration: "20 min" },
-          { day: "Wednesday", activity: "Simple gross motor circuit (walking, stepping, rolling)", goal: "Complete full circuit with minimal prompting", materials: "Foam steps, ball, mat", duration: "25 min" },
-          { day: "Thursday", activity: "1:1 adult-guided play session", goal: "Take 3 turns in back-and-forth play", materials: "Simple toys, bubbles", duration: "20 min" },
-          { day: "Friday", activity: "Daily routine visual schedule review", goal: "Follow 4-step visual schedule independently", materials: "Picture schedule cards", duration: "Throughout day" },
-        ],
-        learningOutcome: "Complete 3 structured activities daily with adult support.",
-        expectedOutcomes: ["Tolerate structured activity for 15+ minutes", "Follow 2-step visual instructions", "Engage in simple back-and-forth interaction"],
-        strategies: ["High repetition and predictability", "Sensory breaks every 15 minutes"],
-        parentTips: ["Practice picture card matching at breakfast", "Use the same visual schedule every morning", "Celebrate every small attempt with praise"],
-        targetScore: Math.min(score + 15, 100),
-      },
-      MEDIUM: {
-        weeklyPlan: [
-          { day: "Monday", activity: "Social story: 'Making Friends at School'", goal: "Retell story with 3 key details", materials: "Social story book, props", duration: "25 min" },
-          { day: "Tuesday", activity: "Fine motor skill station: threading, cutting, building", goal: "Complete all 3 stations in one session", materials: "Beads, safety scissors, blocks", duration: "30 min" },
-          { day: "Wednesday", activity: "Emotion regulation role-play", goal: "Identify feelings and use calming strategy", materials: "Emotion cards, calm-down corner", duration: "20 min" },
-          { day: "Thursday", activity: "Peer buddy activity (game or craft)", goal: "Sustain cooperative interaction for 15 min", materials: "Board game or art supplies", duration: "30 min" },
-          { day: "Friday", activity: "Independent task completion with checklist", goal: "Complete 4-item task checklist independently", materials: "Visual checklist, task materials", duration: "25 min" },
-        ],
-        learningOutcome: "Demonstrate improved social interaction and independent task completion.",
-        expectedOutcomes: ["Initiate 3 peer interactions", "Use calming strategy when upset", "Complete 4-step task independently"],
-        strategies: ["Visual supports for transitions", "Choice boards to increase autonomy"],
-        parentTips: ["Read social story at bedtime", "Practice emotion naming during daily routines"],
-        targetScore: Math.min(score + 12, 100),
-      },
-      HIGH: {
-        weeklyPlan: [
-          { day: "Monday", activity: "Community helper vocabulary and role-play", goal: "Name and role-play 5 community helpers", materials: "Costume props, flashcards", duration: "30 min" },
-          { day: "Tuesday", activity: "Writing/typing simple sentences about self", goal: "Write/type 3 sentences about weekend", materials: "Pencil and paper or tablet", duration: "30 min" },
-          { day: "Wednesday", activity: "Cooperative group project (building or crafting)", goal: "Contribute meaningfully to group outcome", materials: "Project materials", duration: "35 min" },
-          { day: "Thursday", activity: "Problem-solving scenarios and discussion", goal: "Suggest 2 solutions to a given problem", materials: "Scenario cards", duration: "25 min" },
-          { day: "Friday", activity: "Self-evaluation and goal setting", goal: "Rate own performance and set next goal", materials: "Self-rating chart", duration: "20 min" },
-        ],
-        learningOutcome: "Demonstrate higher-order thinking, group cooperation, and self-monitoring.",
-        expectedOutcomes: ["Participate fully in group activity", "Self-evaluate performance accurately", "Generate problem solutions independently"],
-        strategies: ["Metacognitive journaling", "Peer mentoring opportunities"],
-        parentTips: ["Discuss school day events at dinner", "Encourage child to help with household tasks"],
-        targetScore: Math.min(score + 10, 100),
-      },
+      LOW:    { weeklyPlan: [{ day: "Monday", activity: "Sensory exploration with familiar objects", goal: "Engage with 3 textures", materials: "Texture board", duration: "20 min" }, { day: "Tuesday", activity: "Picture-to-object matching", goal: "Match 5 picture cards", materials: "Picture cards", duration: "20 min" }, { day: "Wednesday", activity: "Simple gross motor circuit", goal: "Complete circuit with prompting", materials: "Foam steps, ball", duration: "25 min" }, { day: "Thursday", activity: "Adult-guided play", goal: "3 turns back-and-forth", materials: "Simple toys", duration: "20 min" }, { day: "Friday", activity: "Visual schedule review", goal: "Follow 4-step schedule", materials: "Schedule cards", duration: "Throughout day" }], learningOutcome: "Complete 3 daily structured activities with adult support", expectedOutcomes: ["Tolerate 15 min activity", "Follow 2-step visual instructions"], strategies: ["High repetition", "Sensory breaks every 15 min"], parentTips: ["Practice at breakfast", "Use same schedule daily"], targetScore: Math.min(score + 15, 100) },
+      MEDIUM: { weeklyPlan: [{ day: "Monday", activity: "Social story reading", goal: "Retell 3 key details", materials: "Social story book", duration: "25 min" }, { day: "Tuesday", activity: "Fine motor skill stations", goal: "Complete all 3 stations", materials: "Beads, scissors, blocks", duration: "30 min" }, { day: "Wednesday", activity: "Emotion regulation role-play", goal: "Identify feelings and calm down", materials: "Emotion cards", duration: "20 min" }, { day: "Thursday", activity: "Peer buddy activity", goal: "Cooperate for 15 min", materials: "Board game", duration: "30 min" }, { day: "Friday", activity: "Independent task with checklist", goal: "Complete 4-item checklist", materials: "Visual checklist", duration: "25 min" }], learningOutcome: "Improved social interaction and independent task completion", expectedOutcomes: ["Initiate 3 peer interactions", "Use calming strategy"], strategies: ["Visual supports", "Choice boards"], parentTips: ["Read social story at bedtime"], targetScore: Math.min(score + 12, 100) },
+      HIGH:   { weeklyPlan: [{ day: "Monday", activity: "Community helpers role-play", goal: "Name and act 5 helpers", materials: "Props, flashcards", duration: "30 min" }, { day: "Tuesday", activity: "Writing about self", goal: "Write 3 sentences", materials: "Tablet or paper", duration: "30 min" }, { day: "Wednesday", activity: "Group project", goal: "Meaningful contribution", materials: "Project materials", duration: "35 min" }, { day: "Thursday", activity: "Problem-solving scenarios", goal: "Suggest 2 solutions", materials: "Scenario cards", duration: "25 min" }, { day: "Friday", activity: "Self-evaluation", goal: "Rate own work and set goal", materials: "Self-rating chart", duration: "20 min" }], learningOutcome: "Higher-order thinking, group cooperation, self-monitoring", expectedOutcomes: ["Full group participation", "Self-evaluate accurately"], strategies: ["Metacognitive journaling", "Peer mentoring"], parentTips: ["Discuss school day at dinner"], targetScore: Math.min(score + 10, 100) },
     };
-    return plans[level] || plans["MEDIUM"];
+    return plans[level] ?? plans["MEDIUM"];
   },
 
   _fallbackEvalQuestions: (iepPlan) => [
-    { id: "eq1", category: "goal_achievement", text: `Did your child complete the Monday activity: "${iepPlan.weeklyPlan[0]?.activity}"?`, options: ["Always (4+ times)", "Often (2-3 times)", "Sometimes (1 time)", "Not yet"], scoring: { "Always (4+ times)": 3, "Often (2-3 times)": 2, "Sometimes (1 time)": 1, "Not yet": 0 }, relatedActivity: "Monday" },
-    { id: "eq2", category: "engagement", text: "How engaged was your child during learning activities this week?", options: ["Very engaged throughout", "Engaged most of the time", "Engaged occasionally", "Hard to engage"], scoring: { "Very engaged throughout": 3, "Engaged most of the time": 2, "Engaged occasionally": 1, "Hard to engage": 0 }, relatedActivity: "General" },
-    { id: "eq3", category: "independence", text: "How independently did your child complete tasks this week?", options: ["Mostly independent", "Needed reminders only", "Needed frequent help", "Needed constant support"], scoring: { "Mostly independent": 3, "Needed reminders only": 2, "Needed frequent help": 1, "Needed constant support": 0 }, relatedActivity: "General" },
-    { id: "eq4", category: "social", text: "Did your child interact positively with others during activities?", options: ["Consistently positive", "Usually positive", "Mixed interactions", "Avoided interaction"], scoring: { "Consistently positive": 3, "Usually positive": 2, "Mixed interactions": 1, "Avoided interaction": 0 }, relatedActivity: "Social" },
-    { id: "eq5", category: "goal_achievement", text: `Was this week's main goal achieved: "${iepPlan.learningOutcome.slice(0, 60)}..."?`, options: ["Fully achieved", "Mostly achieved", "Partially achieved", "Not achieved"], scoring: { "Fully achieved": 3, "Mostly achieved": 2, "Partially achieved": 1, "Not achieved": 0 }, relatedActivity: "Goal" },
+    { id: "eq1", category: "goal_achievement", text: `Did your child complete the Monday activity: "${iepPlan.weeklyPlan[0]?.activity}"?`, options: ["Always (4+ times)", "Often (2–3 times)", "Sometimes (1 time)", "Not yet"], scoring: { "Always (4+ times)": 3, "Often (2–3 times)": 2, "Sometimes (1 time)": 1, "Not yet": 0 }, relatedActivity: "Monday" },
+    { id: "eq2", category: "engagement",        text: "How engaged was your child during learning activities?",                              options: ["Very engaged", "Engaged most of the time", "Engaged occasionally", "Hard to engage"], scoring: { "Very engaged": 3, "Engaged most of the time": 2, "Engaged occasionally": 1, "Hard to engage": 0 }, relatedActivity: "General" },
+    { id: "eq3", category: "independence",      text: "How independently did your child complete tasks?",                                    options: ["Mostly independent", "Needed reminders only", "Needed frequent help", "Needed constant support"], scoring: { "Mostly independent": 3, "Needed reminders only": 2, "Needed frequent help": 1, "Needed constant support": 0 }, relatedActivity: "General" },
+    { id: "eq4", category: "social",            text: "Did your child interact positively with others?",                                     options: ["Consistently positive", "Usually positive", "Mixed", "Avoided interaction"], scoring: { "Consistently positive": 3, "Usually positive": 2, "Mixed": 1, "Avoided interaction": 0 }, relatedActivity: "Social" },
+    { id: "eq5", category: "goal_achievement",  text: "Was this week's main goal achieved?",                                                 options: ["Fully achieved", "Mostly achieved", "Partially achieved", "Not achieved"], scoring: { "Fully achieved": 3, "Mostly achieved": 2, "Partially achieved": 1, "Not achieved": 0 }, relatedActivity: "Goal" },
   ],
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SERVICE: assessmentService.js — Extended (all v1 methods preserved)
-// ─────────────────────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 5 — SERVICES  (CRUD layer — mirrors Express route handlers)
+// ════════════════════════════════════════════════════════════════════════════════
 
 const assessmentService = {
-  // Existing getters (unchanged)
-  getParentById: (id) => mockDB.parents.find(p => p.id === id),
-  getEducatorById: (id) => mockDB.educators.find(e => e.id === id),
+  getParentById:         (id)      => mockDB.parents.find(p => p.id === id),
+  getEducatorById:       (id)      => mockDB.educators.find(e => e.id === id),
   getAssessmentsByChild: (childId) => mockDB.assessments.filter(a => a.childID === childId).sort((a, b) => a.weekNumber - b.weekNumber),
-  getIEPByChild: (childId) => mockDB.iepPlans.filter(p => p.childID === childId).sort((a, b) => a.weekNumber - b.weekNumber),
-  getFeedbackByEducator: (eduId) => mockDB.feedback.filter(f => f.educatorID === eduId),
-  getFeedbackByParent: (parentId) => mockDB.feedback.filter(f => f.parentID === parentId),
-
-  // Initial assessment (v1)
-  getInitialAssessment: (childId) => mockDB.initialAssessments.find(ia => ia.childId === childId),
+  getIEPByChild:         (childId) => mockDB.iepPlans.filter(p => p.childID === childId).sort((a, b) => a.weekNumber - b.weekNumber),
+  getFeedbackByEducator: (eduId)   => mockDB.feedback.filter(f => f.educatorID === eduId),
+  getFeedbackByParent:   (pid)     => mockDB.feedback.filter(f => f.parentID === pid),
+  getInitialAssessment:  (childId) => mockDB.initialAssessments.find(ia => ia.childId === childId),
   hasCompletedInitialAssessment: (childId) => mockDB.initialAssessments.some(ia => ia.childId === childId),
+  getWeeklyEvaluations:  (childId) => mockDB.weeklyEvaluations.filter(e => e.childId === childId).sort((a, b) => a.weekNumber - b.weekNumber),
+  hasPendingEvaluation:  (childId, weekNumber) => mockDB.weeklyEvaluations.some(e => e.childId === childId && e.weekNumber === weekNumber),
+
   saveInitialAssessment: (childId, questions, answers, totalScore, level, disabilityType, age) => {
     const record = { id: "ia" + Date.now(), childId, questions, answers, totalScore, level, disabilityType, age, completedAt: new Date().toISOString().slice(0, 10), week1PlanGenerated: false };
     mockDB.initialAssessments.push(record);
     const parent = mockDB.parents.find(p => p.id === childId);
-    if (parent) parent.initialAssessmentDone = true;
+    if (parent) { parent.initialAssessmentDone = true; parent.isNewUser = false; }
     return record;
   },
-  markWeek1PlanGenerated: (childId) => {
-    const ia = mockDB.initialAssessments.find(i => i.childId === childId);
-    if (ia) ia.week1PlanGenerated = true;
-  },
+  markWeek1PlanGenerated: (childId) => { const ia = mockDB.initialAssessments.find(i => i.childId === childId); if (ia) ia.week1PlanGenerated = true; },
   saveWeek1Plan: (childId, educatorId, planData, score, level) => {
     const existing = mockDB.iepPlans.filter(p => p.childID === childId);
     if (existing.some(p => p.weekNumber === 1)) return existing.find(p => p.weekNumber === 1);
@@ -501,11 +738,6 @@ const assessmentService = {
     assessmentService.markWeek1PlanGenerated(childId);
     return plan;
   },
-
-  // Weekly evaluations (v1)
-  getWeeklyEvaluations: (childId) => mockDB.weeklyEvaluations.filter(e => e.childId === childId).sort((a, b) => a.weekNumber - b.weekNumber),
-  getLatestEvaluation: (childId) => { const evals = mockDB.weeklyEvaluations.filter(e => e.childId === childId); return evals.length ? evals[evals.length - 1] : null; },
-  hasPendingEvaluation: (childId, weekNumber) => mockDB.weeklyEvaluations.some(e => e.childId === childId && e.weekNumber === weekNumber),
   saveWeeklyEvaluation: (childId, educatorId, weekNumber, iepPlanId, questions, answers, score, previousScore, aiDecision) => {
     const record = { id: "we" + Date.now(), childId, educatorId, weekNumber, iepPlanId, questions, answers, score, previousScore, improvement: score - previousScore, aiDecision: aiDecision.decision, aiReasoning: aiDecision.reasoning, modifications: aiDecision.modifications, nextWeekHints: aiDecision.nextWeekHints, encouragementMessage: aiDecision.encouragementMessage, completedAt: new Date().toISOString().slice(0, 10) };
     mockDB.weeklyEvaluations.push(record);
@@ -513,157 +745,82 @@ const assessmentService = {
   },
   updateIEPStatus: (planId, status) => { const plan = mockDB.iepPlans.find(p => p.id === planId); if (plan) plan.status = status; return plan; },
   saveNextWeekPlan: (childId, educatorId, weekNumber, planData, score) => {
-    const plan = { id: "iep" + Date.now(), childID: childId, educatorID: educatorId, weeklyPlan: planData.weeklyPlan, learningOutcome: planData.learningOutcome, expectedOutcomes: planData.expectedOutcomes || [], strategies: planData.strategies || [], parentTips: planData.parentTips || [], status: "ONGOING", weekNumber, aiGenerated: true, editedByEducator: false, previousScore: score, targetScore: planData.targetScore, createdAt: new Date().toISOString() };
+    const plan = { id: "iep" + Date.now(), childID: childId, educatorID: educatorId, weeklyPlan: planData.weeklyPlan, learningOutcome: planData.learningOutcome, expectedOutcomes: planData.expectedOutcomes ?? [], strategies: planData.strategies ?? [], parentTips: planData.parentTips ?? [], status: "ONGOING", weekNumber, aiGenerated: true, editedByEducator: false, previousScore: score, targetScore: planData.targetScore, createdAt: new Date().toISOString() };
     mockDB.iepPlans.push(plan);
     return plan;
   },
-  modifyIEPPlan: (planId, modifications) => {
-    const plan = mockDB.iepPlans.find(p => p.id === planId);
-    if (!plan) return null;
-    plan.status = "ONGOING"; plan.modifications = modifications; plan.modifiedAt = new Date().toISOString(); plan.editedByEducator = false; plan.aiModified = true;
-    return plan;
-  },
+  modifyIEPPlan: (planId, modifications) => { const plan = mockDB.iepPlans.find(p => p.id === planId); if (!plan) return null; plan.status = "ONGOING"; plan.modifications = modifications; plan.modifiedAt = new Date().toISOString(); plan.aiModified = true; return plan; },
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SERVICE: milestoneService.js — NEW Feature 1
-// Milestone CRUD — in a real app this maps to /controllers/milestoneController.js
-// ─────────────────────────────────────────────────────────────────────────────
-
 const milestoneService = {
-  /**
-   * GET /api/milestones/:childId — Fetch all milestone records for a child
-   */
   getMilestonesByChild: (childId) => mockDB.milestones.filter(m => m.childId === childId).sort((a, b) => a.week - b.week),
-
-  /**
-   * GET milestones for a specific week
-   */
-  getMilestonesByWeek: (childId, week) => mockDB.milestones.find(m => m.childId === childId && m.week === week),
-
-  /**
-   * POST /api/milestones — Save milestones for a week
-   * Called immediately after generating a new IEP plan (Feature 5 Enhancement)
-   */
+  getMilestonesByWeek:  (childId, week) => mockDB.milestones.find(m => m.childId === childId && m.week === week),
   saveMilestones: (childId, week, milestones) => {
-    const existing = mockDB.milestones.find(m => m.childId === childId && m.week === week);
-    if (existing) return existing;
+    if (mockDB.milestones.find(m => m.childId === childId && m.week === week)) return;
     const record = { id: "ms" + Date.now(), childId, week, milestones, createdAt: new Date().toISOString() };
     mockDB.milestones.push(record);
     return record;
   },
-
-  /**
-   * PATCH /api/milestones/:childId/:week — Update milestone statuses after evaluation
-   * Called automatically in WeeklyEvaluationFlow after AI decision.
-   * Rule: ADVANCE → mark all COMPLETED; MODIFY → keep PENDING
-   */
   updateMilestoneStatus: (childId, week, aiDecision) => {
     const record = mockDB.milestones.find(m => m.childId === childId && m.week === week);
     if (!record) return null;
-    record.milestones = record.milestones.map(ms => ({
-      ...ms,
-      status: aiDecision === "ADVANCE" ? "COMPLETED" : ms.status
-    }));
+    record.milestones = record.milestones.map(ms => ({ ...ms, status: aiDecision === "ADVANCE" ? "COMPLETED" : ms.status }));
     return record;
   },
-
-  /**
-   * Toggle individual milestone status (parent can manually mark)
-   */
-  toggleMilestone: (childId, week, milestoneIndex) => {
+  toggleMilestone: (childId, week, idx) => {
     const record = mockDB.milestones.find(m => m.childId === childId && m.week === week);
-    if (!record || !record.milestones[milestoneIndex]) return null;
-    const current = record.milestones[milestoneIndex].status;
-    record.milestones[milestoneIndex].status = current === "PENDING" ? "COMPLETED" : "PENDING";
+    if (!record?.milestones[idx]) return null;
+    record.milestones[idx].status = record.milestones[idx].status === "PENDING" ? "COMPLETED" : "PENDING";
     return record;
   },
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SERVICE: progressService.js — NEW Feature 2
-// Maps to GET /api/progress/:childId
-// ─────────────────────────────────────────────────────────────────────────────
-
 const progressService = {
-  /**
-   * GET /api/progress/:childId
-   * Returns week-by-week score data for the progress graph.
-   * Merges initial assessment data + educator assessments + weekly evaluations.
-   */
   getProgressData: (childId) => {
     const data = [];
-
-    // Educator-recorded assessments (existing assessments collection)
-    const assessments = mockDB.assessments.filter(a => a.childID === childId).sort((a, b) => a.weekNumber - b.weekNumber);
-    assessments.forEach(a => {
-      if (!data.find(d => d.week === a.weekNumber)) {
-        data.push({ week: a.weekNumber, score: a.score, source: "assessment" });
-      }
-    });
-
-    // Weekly evaluations (parent-reported, AI scored)
-    const weeklyEvals = mockDB.weeklyEvaluations.filter(e => e.childId === childId).sort((a, b) => a.weekNumber - b.weekNumber);
-    weeklyEvals.forEach(e => {
-      const existing = data.find(d => d.week === e.weekNumber);
-      if (existing) {
-        existing.evalScore = e.score; // show both
-      } else {
-        data.push({ week: e.weekNumber, score: e.score, source: "evaluation" });
-      }
-    });
-
+    mockDB.assessments.filter(a => a.childID === childId).sort((a, b) => a.weekNumber - b.weekNumber).forEach(a => { if (!data.find(d => d.week === a.weekNumber)) data.push({ week: a.weekNumber, score: a.score }); });
+    mockDB.weeklyEvaluations.filter(e => e.childId === childId).sort((a, b) => a.weekNumber - b.weekNumber).forEach(e => { const ex = data.find(d => d.week === e.weekNumber); if (ex) ex.evalScore = e.score; else data.push({ week: e.weekNumber, score: e.score }); });
     return data.sort((a, b) => a.week - b.week);
   },
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SERVICE: summaryService.js — NEW Feature 3
-// Weekly Summary CRUD
-// ─────────────────────────────────────────────────────────────────────────────
+/** POST /api/assessment — Multi-domain assessment service */
+const multiDomainService = {
+  getAssessmentByUser: (userId) => mockDB.multiDomainAssessments.find(a => a.userId === userId),
+  saveAssessment: (userId, domainScores, overallScore, overallLevel, breakdown) => {
+    const existing = mockDB.multiDomainAssessments.find(a => a.userId === userId);
+    if (existing) { Object.assign(existing, { iqScore: domainScores.iq ?? 0, cognitiveScore: domainScores.cognitive ?? 0, motorScore: domainScores.motor ?? 0, communicationScore: domainScores.communication ?? 0, overallLevel, breakdown, completedAt: new Date().toISOString().slice(0, 10) }); return existing; }
+    const record = { id: "mda" + Date.now(), userId, iqScore: domainScores.iq ?? 0, cognitiveScore: domainScores.cognitive ?? 0, motorScore: domainScores.motor ?? 0, communicationScore: domainScores.communication ?? 0, overallLevel, breakdown, completedAt: new Date().toISOString().slice(0, 10) };
+    mockDB.multiDomainAssessments.push(record);
+    return record;
+  },
+};
+
+/** GET /api/education-plan/:userId — Education plan service */
+const educationPlanService = {
+  getPlanByUser: (userId) => mockDB.educationPlans.find(p => p.userId === userId),
+  savePlan: (userId, planData) => {
+    const existing = mockDB.educationPlans.find(p => p.userId === userId);
+    if (existing) { Object.assign(existing, planData); return existing; }
+    const record = { id: "ep" + Date.now(), userId, ...planData };
+    mockDB.educationPlans.push(record);
+    return record;
+  },
+};
 
 const summaryService = {
-  /**
-   * GET /api/summaries/:childId — All summaries for a child
-   */
   getSummariesByChild: (childId) => mockDB.weeklySummaries.filter(s => s.childId === childId).sort((a, b) => b.week - a.week),
-
-  /**
-   * GET summary for a specific week
-   */
-  getSummaryByWeek: (childId, week) => mockDB.weeklySummaries.find(s => s.childId === childId && s.week === week),
-
-  /**
-   * POST /api/summaries — Save weekly summary (English + Tamil)
-   */
-  saveSummary: (childId, week, summaryEnglish, summaryRegional) => {
+  saveSummary: (childId, week, summaries) => {
     const existing = mockDB.weeklySummaries.find(s => s.childId === childId && s.week === week);
-    if (existing) { existing.summaryEnglish = summaryEnglish; existing.summaryRegional = summaryRegional; return existing; }
-    const record = { id: "ws" + Date.now(), childId, week, summaryEnglish, summaryRegional, createdAt: new Date().toISOString().slice(0, 10) };
+    if (existing) { existing.summaries = summaries; return existing; }
+    const record = { id: "ws" + Date.now(), childId, week, summaries, createdAt: new Date().toISOString().slice(0, 10) };
     mockDB.weeklySummaries.push(record);
     return record;
   },
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SERVICE: educatorService.js — NEW Feature 4
-// Educator assignment based on specialization matching
-// ─────────────────────────────────────────────────────────────────────────────
-
 const educatorService = {
-  /**
-   * Find an educator matching the child's disability type.
-   * Called on parent registration.
-   * Returns educator or null.
-   */
-  findMatchingEducator: (disabilityType) => {
-    return mockDB.educators.find(e => e.educatorType === disabilityType) || null;
-  },
-
-  /**
-   * Assign an educator to a child.
-   * Only called when a match is found.
-   */
+  findMatchingEducator: (disabilityType) => mockDB.educators.find(e => e.educatorType === disabilityType) ?? null,
   assignEducator: (parentId, educatorId) => {
     const parent = mockDB.parents.find(p => p.id === parentId);
     const educator = mockDB.educators.find(e => e.id === educatorId);
@@ -672,360 +829,477 @@ const educatorService = {
     if (!educator.assignedChildren.includes(parentId)) educator.assignedChildren.push(parentId);
     return true;
   },
-
-  /**
-   * Check if a child has a matching educator available.
-   * Used to show "Please wait" message in UI.
-   */
-  hasMatchingEducator: (disabilityType) => {
-    return mockDB.educators.some(e => e.educatorType === disabilityType);
-  },
-
-  /**
-   * Simulate a deferred matching — called when a new educator registers
-   * with a specialization that matches unassigned children.
-   */
   runDeferredMatching: (educatorId) => {
     const educator = mockDB.educators.find(e => e.id === educatorId);
     if (!educator) return 0;
     let matched = 0;
-    mockDB.parents.forEach(parent => {
-      if (!parent.assignedEducatorID && parent.disabilityType === educator.educatorType) {
-        educatorService.assignEducator(parent.id, educatorId);
-        matched++;
-      }
-    });
+    mockDB.parents.forEach(parent => { if (!parent.assignedEducatorID && parent.disabilityType === educator.educatorType) { educatorService.assignEducator(parent.id, educatorId); matched++; } });
     return matched;
   },
 };
-
-// ─────────────────────────────────────────────────────────────────────────────
-// AUTH — Extended for Feature 4 (no default educator assignment)
-// ─────────────────────────────────────────────────────────────────────────────
 
 const mockAuth = {
   login: (email, password, role) => {
     const db = role === "educator" ? mockDB.educators : mockDB.parents;
     const user = db.find(u => u.email === email && u.password === password);
     if (!user) return { error: "Invalid credentials" };
-    const token = btoa(JSON.stringify({ id: user.id, role, email }));
-    return { token, user, role };
+    return { token: btoa(JSON.stringify({ id: user.id, role, email })), user, role };
   },
-
   register: (data, role) => {
     if (role === "educator") {
-      const exists = mockDB.educators.find(e => e.email === data.email);
-      if (exists) return { error: "Email already registered" };
+      if (mockDB.educators.find(e => e.email === data.email)) return { error: "Email already registered" };
       const newEdu = { ...data, id: "edu" + Date.now(), assignedChildren: [] };
       mockDB.educators.push(newEdu);
-      // Feature 4: Run deferred matching for waiting children
       const matchedCount = educatorService.runDeferredMatching(newEdu.id);
-      const token = btoa(JSON.stringify({ id: newEdu.id, role, email: data.email }));
-      return { token, user: newEdu, role, matchedCount };
+      return { token: btoa(JSON.stringify({ id: newEdu.id, role, email: data.email })), user: newEdu, role, matchedCount };
     } else {
-      const exists = mockDB.parents.find(p => p.email === data.email);
-      if (exists) return { error: "Email already registered" };
-
-      // Feature 4: Match only if educator with same specialization exists
+      if (mockDB.parents.find(p => p.email === data.email)) return { error: "Email already registered" };
       const matchedEdu = educatorService.findMatchingEducator(data.disabilityType);
+      const grade = curriculumEngine.getGradeFromAge(data.age);
       const uniqueChildID = "CHILD-" + String(Math.floor(Math.random() * 900000) + 100000);
-
-      const newParent = {
-        ...data, id: "par" + Date.now(), uniqueChildID,
-        // Only assign educator if matched; null means "waiting"
-        assignedEducatorID: matchedEdu?.id || null,
-        initialAssessmentDone: false
-      };
+      const newParent = { ...data, id: "par" + Date.now(), uniqueChildID, assignedEducatorID: matchedEdu?.id ?? null, isNewUser: true, initialAssessmentDone: false, gradeLevel: grade };
       mockDB.parents.push(newParent);
-
       if (matchedEdu) matchedEdu.assignedChildren.push(newParent.id);
-
-      const token = btoa(JSON.stringify({ id: newParent.id, role, email: data.email }));
-      return {
-        token, user: newParent, role,
-        assignedEducator: matchedEdu || null,
-        requiresInitialAssessment: true,
-        // Feature 4: UI uses this to show "waiting" message
-        educatorPending: !matchedEdu,
-      };
+      return { token: btoa(JSON.stringify({ id: newParent.id, role, email: data.email })), user: newParent, role, assignedEducator: matchedEdu ?? null, requiresInitialAssessment: true, educatorPending: !matchedEdu };
     }
-  }
+  },
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// UI HELPERS (preserved from v1, unchanged)
-// ─────────────────────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 6 — DESIGN SYSTEM
+// ════════════════════════════════════════════════════════════════════════════════
 
-const colors = {
-  primary: "#1a3a5c", secondary: "#e85d26", accent: "#34c2b3",
-  soft: "#f0f7ff", card: "#ffffff", border: "#dce8f5",
-  text: "#1e2b3a", muted: "#6b859e", success: "#2db87a",
-  warning: "#f5a623", danger: "#e84b4b",
-  gradient: "linear-gradient(135deg, #1a3a5c 0%, #2563a8 60%, #34c2b3 100%)",
+const C = {
+  primary:   "#1a3a5c",
+  secondary: "#e85d26",
+  accent:    "#34c2b3",
+  soft:      "#f0f7ff",
+  card:      "#ffffff",
+  border:    "#dce8f5",
+  text:      "#1e2b3a",
+  muted:     "#6b859e",
+  success:   "#2db87a",
+  warning:   "#f5a623",
+  danger:    "#e84b4b",
+  gradient:  "linear-gradient(135deg, #1a3a5c 0%, #2563a8 60%, #34c2b3 100%)",
+  domain:    { iq: "#6366f1", cognitive: "#f59e0b", motor: "#10b981", communication: "#ec4899" },
 };
 
-const globalStyle = `
+const G = `
   @import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&family=DM+Serif+Display&display=swap');
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: 'Nunito', sans-serif; color: #1e2b3a; }
-  .fade-in { animation: fadeIn 0.35s ease; }
-  @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
-  .pulse { animation: pulse 1.5s ease-in-out infinite; }
-  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.5; } }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{font-family:'Nunito',sans-serif;color:#1e2b3a;}
+  .fade-in{animation:fadeIn 0.35s ease;}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+  .pulse{animation:pulse 1.5s ease-in-out infinite;}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
+  .slide-in{animation:slideIn 0.4s cubic-bezier(0.34,1.56,0.64,1);}
+  @keyframes slideIn{from{opacity:0;transform:scale(0.95)}to{opacity:1;transform:scale(1)}}
+  @keyframes spin{to{transform:rotate(360deg)}}
 `;
 
 const disabilityTypes = ["Autism", "ADHD", "Intellectual Disability", "Down Syndrome"];
-const languages = ["English", "Tamil", "Hindi", "Telugu", "Malayalam", "Kannada"];
+
+// ── Primitive components ──────────────────────────────────────────────────────
 
 const Card = ({ children, style = {} }) => (
-  <div style={{ background: colors.card, borderRadius: 16, border: `1px solid ${colors.border}`, padding: 20, boxShadow: "0 2px 12px rgba(26,58,92,0.06)", ...style }}>{children}</div>
+  <div style={{ background: C.card, borderRadius: 16, border: `1px solid ${C.border}`, padding: 20, boxShadow: "0 2px 12px rgba(26,58,92,0.06)", ...style }}>{children}</div>
 );
 
 const Badge = ({ children, color = "blue" }) => {
-  const map = { blue: ["#dbeafe", "#1d4ed8"], green: ["#d1fae5", "#065f46"], orange: ["#ffedd5", "#9a3412"], red: ["#fee2e2", "#991b1b"], teal: ["#ccfbf1", "#0f766e"], purple: ["#ede9fe", "#5b21b6"], yellow: ["#fefce8", "#854d0e"] };
-  const [bg, fg] = map[color] || map.blue;
+  const map = { blue: ["#dbeafe","#1d4ed8"], green: ["#d1fae5","#065f46"], orange: ["#ffedd5","#9a3412"], red: ["#fee2e2","#991b1b"], teal: ["#ccfbf1","#0f766e"], purple: ["#ede9fe","#5b21b6"], yellow: ["#fefce8","#854d0e"], indigo: ["#e0e7ff","#3730a3"], pink: ["#fce7f3","#9d174d"] };
+  const [bg, fg] = map[color] ?? map.blue;
   return <span style={{ background: bg, color: fg, padding: "3px 10px", borderRadius: 20, fontSize: 12, fontWeight: 700 }}>{children}</span>;
 };
 
 const Button = ({ children, onClick, disabled, variant = "primary", size = "md", style = {} }) => {
-  const base = { border: "none", borderRadius: 10, cursor: disabled ? "not-allowed" : "pointer", fontFamily: "Nunito", fontWeight: 700, transition: "all 0.2s", opacity: disabled ? 0.6 : 1, ...style };
-  const sizes = { sm: { padding: "7px 14px", fontSize: 13 }, md: { padding: "10px 20px", fontSize: 14 }, lg: { padding: "13px 28px", fontSize: 15 } };
-  const variants = {
-    primary: { background: colors.secondary, color: "#fff" },
-    secondary: { background: colors.accent, color: "#fff" },
-    outline: { background: "transparent", border: `1.5px solid ${colors.border}`, color: colors.text },
-    ghost: { background: "transparent", color: colors.primary },
-    danger: { background: colors.danger, color: "#fff" },
-    success: { background: colors.success, color: "#fff" },
-  };
-  return <button onClick={onClick} disabled={disabled} style={{ ...base, ...sizes[size], ...variants[variant] }}>{children}</button>;
+  const sz = { sm: { padding: "7px 14px", fontSize: 13 }, md: { padding: "10px 20px", fontSize: 14 }, lg: { padding: "13px 28px", fontSize: 15 } };
+  const va = { primary: { background: C.secondary, color: "#fff" }, secondary: { background: C.accent, color: "#fff" }, outline: { background: "transparent", border: `1.5px solid ${C.border}`, color: C.text }, ghost: { background: "transparent", color: C.primary }, danger: { background: C.danger, color: "#fff" }, success: { background: C.success, color: "#fff" } };
+  return <button onClick={onClick} disabled={disabled} style={{ border: "none", borderRadius: 10, cursor: disabled ? "not-allowed" : "pointer", fontFamily: "Nunito", fontWeight: 700, transition: "all 0.2s", opacity: disabled ? 0.6 : 1, ...sz[size], ...va[variant], ...style }}>{children}</button>;
 };
 
-const Spinner = ({ size = 24, color = colors.accent }) => (
-  <div style={{ width: size, height: size, border: `3px solid ${color}30`, borderTop: `3px solid ${color}`, borderRadius: "50%", animation: "spin 0.8s linear infinite" }}>
-    <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
-  </div>
+const Spinner = ({ size = 24, color = C.accent }) => (
+  <div style={{ width: size, height: size, border: `3px solid ${color}30`, borderTop: `3px solid ${color}`, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
 );
 
 const Alert = ({ children, type = "info" }) => {
-  const map = { info: ["#dbeafe", "#1e40af", "ℹ️"], success: ["#d1fae5", "#065f46", "✅"], warning: ["#ffedd5", "#9a3412", "⚠️"], error: ["#fee2e2", "#991b1b", "❌"] };
+  const map = { info: ["#dbeafe","#1e40af","ℹ️"], success: ["#d1fae5","#065f46","✅"], warning: ["#ffedd5","#9a3412","⚠️"], error: ["#fee2e2","#991b1b","❌"] };
   const [bg, fg, icon] = map[type];
   return <div style={{ background: bg, color: fg, padding: "12px 16px", borderRadius: 10, marginBottom: 16, fontSize: 13, fontWeight: 600, display: "flex", alignItems: "flex-start", gap: 8 }}><span>{icon}</span><span>{children}</span></div>;
 };
 
 const Input = ({ label, value, onChange, type = "text", placeholder, required, options }) => (
   <div style={{ marginBottom: 14 }}>
-    <label style={{ display: "block", fontWeight: 700, fontSize: 13, color: colors.primary, marginBottom: 6 }}>{label}{required && <span style={{ color: colors.danger }}>*</span>}</label>
+    <label style={{ display: "block", fontWeight: 700, fontSize: 13, color: C.primary, marginBottom: 6 }}>{label}{required && <span style={{ color: C.danger }}>*</span>}</label>
     {options ? (
-      <select value={value} onChange={e => onChange(e.target.value)} style={{ width: "100%", padding: "10px 12px", border: `1.5px solid ${colors.border}`, borderRadius: 10, fontFamily: "Nunito", fontSize: 14, outline: "none", background: "#fff", color: colors.text }}>
-        {options.map(o => <option key={o}>{o}</option>)}
+      <select value={value} onChange={e => onChange(e.target.value)} style={{ width: "100%", padding: "10px 12px", border: `1.5px solid ${C.border}`, borderRadius: 10, fontFamily: "Nunito", fontSize: 14, outline: "none", background: "#fff", color: C.text }}>
+        {options.map(o => <option key={typeof o === "string" ? o : o.value} value={typeof o === "string" ? o : o.value}>{typeof o === "string" ? o : o.label}</option>)}
       </select>
     ) : (
-      <input type={type} value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder} style={{ width: "100%", padding: "10px 12px", border: `1.5px solid ${colors.border}`, borderRadius: 10, fontFamily: "Nunito", fontSize: 14, outline: "none" }} />
+      <input type={type} value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder} style={{ width: "100%", padding: "10px 12px", border: `1.5px solid ${C.border}`, borderRadius: 10, fontFamily: "Nunito", fontSize: 14, outline: "none" }} />
     )}
   </div>
 );
 
-const ProgressBar = ({ value, max = 100, color = colors.accent, height = 10 }) => (
-  <div style={{ background: colors.border, borderRadius: 20, overflow: "hidden", height }}>
-    <div style={{ width: `${Math.min((value / max) * 100, 100)}%`, height: "100%", background: color, borderRadius: 20, transition: "width 0.6s ease" }} />
+const ProgressBar = ({ value, max = 100, color = C.accent, height = 10 }) => (
+  <div style={{ background: C.border, borderRadius: 20, overflow: "hidden", height }}>
+    <div style={{ width: `${Math.min((value / max) * 100, 100)}%`, height: "100%", background: color, borderRadius: 20, transition: "width 0.8s ease" }} />
   </div>
 );
 
-const ScoreBadge = ({ score }) => {
-  const color = score >= 70 ? "green" : score >= 40 ? "orange" : "red";
-  const label = score >= 70 ? "HIGH" : score >= 40 ? "MEDIUM" : "LOW";
-  return <Badge color={color}>{label} ({score}/100)</Badge>;
+const DomainScoreCard = ({ domain, score, icon, color }) => (
+  <div style={{ background: `${color}10`, border: `1.5px solid ${color}30`, borderRadius: 14, padding: 16, textAlign: "center" }}>
+    <div style={{ fontSize: 28, marginBottom: 6 }}>{icon}</div>
+    <div style={{ fontSize: 24, fontWeight: 900, color }}>{score}<span style={{ fontSize: 14, color: C.muted }}>/100</span></div>
+    <div style={{ fontSize: 12, fontWeight: 700, color: C.muted, marginTop: 4 }}>{domain}</div>
+    <ProgressBar value={score} max={100} color={color} height={4} />
+  </div>
+);
+
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 7 — MULTI-DOMAIN ASSESSMENT FLOW  (New User Gate)
+// If isNewUser === true → this is shown before the main dashboard.
+// Flow: intro → loading → domain questions → results → IEP
+// ════════════════════════════════════════════════════════════════════════════════
+
+const MultiDomainAssessmentFlow = ({ parent, onComplete }) => {
+  const [phase, setPhase]               = useState("intro");
+  const [domains, setDomains]           = useState(null);
+  const [currentDomain, setCurrentDomain] = useState(0);
+  const [currentQ, setCurrentQ]         = useState(0);
+  const [answers, setAnswers]           = useState({});
+  const [sliders, setSliders]           = useState({});
+  const [result, setResult]             = useState(null);
+  const [iep, setIep]                   = useState(null);
+  const [iepLoading, setIepLoading]     = useState(false);
+
+  const domainOrder = ["iq", "cognitive", "motor", "communication"];
+  const domainLabels = { iq: "IQ & Reasoning", cognitive: "Cognitive Skills", motor: "Motor Skills", communication: "Communication" };
+  const domainIcons  = { iq: "🧠", cognitive: "💡", motor: "✋", communication: "💬" };
+  const domainColorMap = C.domain;
+
+  const grade = curriculumEngine.getGradeFromAge(parent.age);
+  const gradeInfo = curriculumEngine.getSubjectsForGrade(grade);
+
+  const loadDomains = async () => {
+    setPhase("loading");
+    const d = await aiService.generateMultiDomainTest(parent.age, parent.disabilityType);
+    setDomains(d); setCurrentDomain(0); setCurrentQ(0);
+    setPhase("domain");
+  };
+
+  const dk = domainOrder[currentDomain];
+  const domainData = domains?.[dk];
+  const allQs = domainData?.questions ?? [];
+  const curQ  = allQs[currentQ];
+
+  const handleNextQ = () => {
+    if (currentQ < allQs.length - 1) { setCurrentQ(c => c + 1); }
+    else if (currentDomain < domainOrder.length - 1) { setCurrentDomain(d => d + 1); setCurrentQ(0); }
+    else { submitAssessment(); }
+  };
+
+  const isAnswered = () => {
+    if (!curQ) return true;
+    if (curQ.type === "slider") return true;
+    return !!answers[curQ.id];
+  };
+
+  const submitAssessment = () => {
+    const allAnswers = { ...answers, ...sliders };
+    const { domainScores, overallScore, overallLevel } = aiService.evaluateMultiDomainAssessment(allAnswers, domains);
+    const record = multiDomainService.saveAssessment(parent.id, domainScores, overallScore, overallLevel, allAnswers);
+    assessmentService.saveInitialAssessment(parent.id, [], [], overallScore, overallLevel, parent.disabilityType, parent.age);
+    setResult({ domainScores, overallScore, overallLevel, record });
+    setPhase("results");
+  };
+
+  const generateIEP = async () => {
+    setIepLoading(true);
+    const iepData = await aiService.generateIEP(parent, result);
+    const saved = educationPlanService.savePlan(parent.id, iepData);
+    setIep(saved); setIepLoading(false); setPhase("iep");
+  };
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.gradient, padding: 20, display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <style>{G}</style>
+      <div style={{ width: "100%", maxWidth: 640 }} className="fade-in">
+
+        {/* ── INTRO ── */}
+        {phase === "intro" && (
+          <Card style={{ padding: 36 }}>
+            <div style={{ textAlign: "center", marginBottom: 24 }}>
+              <div style={{ fontSize: 56, marginBottom: 12 }}>🧩</div>
+              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 28, color: C.primary, marginBottom: 8 }}>Welcome to EduPath!</h2>
+              <p style={{ color: C.muted, fontSize: 14 }}>Hello, {parent.parentName}! Let's understand {parent.childName}'s abilities before creating a personalised plan.</p>
+            </div>
+
+            {/* Grade pill */}
+            <div style={{ background: "#eff6ff", border: "1.5px solid #bfdbfe", borderRadius: 14, padding: 16, marginBottom: 20 }}>
+              <div style={{ fontWeight: 800, color: "#1d4ed8", fontSize: 13, marginBottom: 8 }}>📚 {gradeInfo.label} — Age {parent.age} ({curriculumEngine.getAgeRangeForGrade(grade)})</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                {gradeInfo.subjects.map(s => <span key={s.name} style={{ background: "#dbeafe", color: "#1d4ed8", padding: "4px 10px", borderRadius: 20, fontSize: 12, fontWeight: 700 }}>{s.icon} {s.name}</span>)}
+              </div>
+            </div>
+
+            {!parent.assignedEducatorID && <Alert type="warning">Please wait while we find a suitable educator. Complete the assessment to generate {parent.childName}'s personalised IEP.</Alert>}
+            {parent.assignedEducatorID  && <Alert type="success">Matched with {assessmentService.getEducatorById(parent.assignedEducatorID)?.name} — {parent.disabilityType} Specialist</Alert>}
+
+            <div style={{ marginBottom: 24 }}>
+              <div style={{ fontWeight: 800, color: C.primary, marginBottom: 12 }}>This assessment covers 4 domains:</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                {[
+                  ["🧠", "IQ & Reasoning",   "Pattern recognition, logic, memory"],
+                  ["💡", "Cognitive Skills", "Attention, problem-solving, instructions"],
+                  ["✋", "Motor Skills",     "Fine motor (writing), gross motor (movement)"],
+                  ["💬", "Communication",   "Speech clarity, vocabulary, understanding"],
+                ].map(([icon, title, desc]) => (
+                  <div key={title} style={{ padding: 12, background: C.soft, borderRadius: 12 }}>
+                    <div style={{ fontSize: 20, marginBottom: 4 }}>{icon}</div>
+                    <div style={{ fontWeight: 800, fontSize: 13, color: C.primary }}>{title}</div>
+                    <div style={{ fontSize: 11, color: C.muted, marginTop: 3 }}>{desc}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <Button onClick={loadDomains} size="lg" style={{ width: "100%" }}>Begin Multi-Domain Assessment →</Button>
+          </Card>
+        )}
+
+        {/* ── LOADING ── */}
+        {phase === "loading" && (
+          <Card style={{ padding: 48, textAlign: "center" }}>
+            <div className="pulse" style={{ fontSize: 48, marginBottom: 16 }}>🤖</div>
+            <p style={{ fontFamily: "DM Serif Display", fontSize: 22, color: C.primary }}>Preparing personalised assessment…</p>
+            <div style={{ marginTop: 20, display: "flex", justifyContent: "center" }}><Spinner size={36} /></div>
+          </Card>
+        )}
+
+        {/* ── DOMAIN QUESTIONS ── */}
+        {phase === "domain" && curQ && (
+          <Card style={{ padding: 32 }} className="slide-in">
+            {/* Progress stepper */}
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+                {domainOrder.map((d, i) => (
+                  <div key={d} style={{ flex: 1, height: 6, borderRadius: 10, background: i < currentDomain ? C.success : i === currentDomain ? domainColorMap[d] : C.border, transition: "all 0.3s" }} />
+                ))}
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div>
+                  <div style={{ fontSize: 12, color: C.muted, fontWeight: 700 }}>DOMAIN {currentDomain + 1}/4 — {domainIcons[dk]} {domainLabels[dk].toUpperCase()}</div>
+                  <div style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>Question {currentQ + 1} of {allQs.length}</div>
+                </div>
+                <div style={{ fontSize: 20, fontWeight: 900, color: domainColorMap[dk] }}>{domainIcons[dk]}</div>
+              </div>
+            </div>
+
+            <h3 style={{ fontFamily: "DM Serif Display", fontSize: 19, color: C.primary, marginBottom: 24, lineHeight: 1.5 }}>{curQ.text}</h3>
+
+            {/* MCQ options */}
+            {curQ.type === "mcq" && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 24 }}>
+                {curQ.options.map(opt => (
+                  <button key={opt} onClick={() => setAnswers(p => ({ ...p, [curQ.id]: opt }))}
+                    style={{ padding: "12px 18px", borderRadius: 12, border: `2px solid ${answers[curQ.id] === opt ? domainColorMap[dk] : C.border}`, background: answers[curQ.id] === opt ? `${domainColorMap[dk]}15` : "#fff", color: answers[curQ.id] === opt ? domainColorMap[dk] : C.text, fontFamily: "Nunito", fontWeight: answers[curQ.id] === opt ? 800 : 600, fontSize: 14, textAlign: "left", cursor: "pointer", transition: "all 0.15s" }}>
+                    {answers[curQ.id] === opt ? "✓ " : ""}{opt}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* Slider */}
+            {curQ.type === "slider" && (
+              <div style={{ marginBottom: 24 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+                  <span style={{ fontSize: 13, color: C.muted }}>Very limited</span>
+                  <span style={{ fontSize: 20, fontWeight: 900, color: domainColorMap[dk] }}>{sliders[curQ.id] ?? 50}/100</span>
+                  <span style={{ fontSize: 13, color: C.muted }}>Age-appropriate</span>
+                </div>
+                <input type="range" min={0} max={100} value={sliders[curQ.id] ?? 50}
+                  onChange={e => setSliders(p => ({ ...p, [curQ.id]: Number(e.target.value) }))}
+                  style={{ width: "100%", accentColor: domainColorMap[dk] }} />
+                <div style={{ marginTop: 8 }}>
+                  <ProgressBar value={sliders[curQ.id] ?? 50} max={100} color={domainColorMap[dk]} height={6} />
+                </div>
+              </div>
+            )}
+
+            <Button onClick={handleNextQ} disabled={!isAnswered()} size="lg" style={{ width: "100%" }}>
+              {currentDomain === domainOrder.length - 1 && currentQ === allQs.length - 1 ? "Submit Assessment →" : "Next →"}
+            </Button>
+          </Card>
+        )}
+
+        {/* ── RESULTS ── */}
+        {phase === "results" && result && (
+          <Card style={{ padding: 36 }} className="fade-in">
+            <div style={{ textAlign: "center", marginBottom: 28 }}>
+              <div style={{ fontSize: 52, marginBottom: 10 }}>📊</div>
+              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: C.primary, marginBottom: 6 }}>Assessment Complete!</h2>
+              <p style={{ color: C.muted, fontSize: 14 }}>Here is {parent.childName}'s ability profile across all 4 domains.</p>
+            </div>
+
+            {/* Domain score grid */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 12, marginBottom: 24 }}>
+              {[
+                { key: "iq",            label: "IQ & Reasoning", icon: "🧠", color: C.domain.iq },
+                { key: "cognitive",     label: "Cognitive",       icon: "💡", color: C.domain.cognitive },
+                { key: "motor",         label: "Motor",           icon: "✋", color: C.domain.motor },
+                { key: "communication", label: "Communication",   icon: "💬", color: C.domain.communication },
+              ].map(d => <DomainScoreCard key={d.key} domain={d.label} score={result.domainScores[d.key] ?? 0} icon={d.icon} color={d.color} />)}
+            </div>
+
+            {/* Overall badge */}
+            <div style={{ background: result.overallLevel === "HIGH" ? "#d1fae5" : result.overallLevel === "MEDIUM" ? "#ffedd5" : "#fee2e2", borderRadius: 14, padding: 16, marginBottom: 24, textAlign: "center" }}>
+              <div style={{ fontSize: 13, color: C.muted, fontWeight: 700, marginBottom: 4 }}>OVERALL ABILITY LEVEL</div>
+              <div style={{ fontSize: 28, fontWeight: 900, color: result.overallLevel === "HIGH" ? "#065f46" : result.overallLevel === "MEDIUM" ? "#9a3412" : "#991b1b" }}>
+                {result.overallLevel} — {result.overallScore}/100
+              </div>
+            </div>
+
+            <Alert type="info">
+              <strong>Next step:</strong> Generate {parent.childName}'s personalised IEP based on these results. The plan will be aligned to <strong>{gradeInfo.label}</strong> curriculum with modifications for {result.overallLevel} ability.
+            </Alert>
+
+            <Button onClick={generateIEP} disabled={iepLoading} size="lg" style={{ width: "100%" }}>
+              {iepLoading ? <span style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}><Spinner size={18} color="#fff" />Generating IEP…</span> : "🎓 Generate My IEP →"}
+            </Button>
+          </Card>
+        )}
+
+        {/* ── IEP GENERATED ── */}
+        {phase === "iep" && iep && (
+          <Card style={{ padding: 32 }} className="fade-in">
+            <div style={{ textAlign: "center", marginBottom: 24 }}>
+              <div style={{ fontSize: 52, marginBottom: 10 }}>🎉</div>
+              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: C.primary, marginBottom: 6 }}>IEP Generated!</h2>
+              <div style={{ display: "flex", gap: 8, justifyContent: "center", flexWrap: "wrap" }}>
+                <Badge color="blue">{iep.gradeLabel}</Badge>
+                <Badge color={iep.overallLevel === "HIGH" ? "green" : iep.overallLevel === "MEDIUM" ? "orange" : "red"}>{iep.overallLevel} Ability</Badge>
+                <Badge color="purple">AI Personalised</Badge>
+              </div>
+            </div>
+
+            {/* Subject goals preview */}
+            <Card style={{ marginBottom: 16, background: "#eff6ff", border: "1px solid #bfdbfe" }}>
+              <div style={{ fontWeight: 800, color: "#1d4ed8", marginBottom: 12 }}>📚 Modified Curriculum for {iep.gradeLabel}</div>
+              {(iep.subjects ?? []).slice(0, 3).map((s, i) => (
+                <div key={i} style={{ marginBottom: 8, fontSize: 13 }}>
+                  <span style={{ fontWeight: 700 }}>{s.icon} {s.name}:</span> <span style={{ color: C.muted }}>{s.modifiedGoal}</span>
+                </div>
+              ))}
+            </Card>
+
+            <Alert type="success">Your IEP is ready! Head to the "My IEP" tab in your dashboard to view the full plan including all goals, recommendations, and accommodations.</Alert>
+
+            <Button onClick={onComplete} size="lg" style={{ width: "100%" }}>Go to My Dashboard →</Button>
+          </Card>
+        )}
+      </div>
+    </div>
+  );
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// NEW COMPONENT: MilestoneTracker — Feature 1
-// Shows milestones for a given week with PENDING/COMPLETED status toggle
-// ─────────────────────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 8 — SHARED COMPONENTS
+// ════════════════════════════════════════════════════════════════════════════════
 
 const MilestoneTracker = ({ childId, week, refreshKey }) => {
   const [record, setRecord] = useState(() => milestoneService.getMilestonesByWeek(childId, week));
-  const [generating, setGenerating] = useState(false);
-
-  useEffect(() => {
-    setRecord(milestoneService.getMilestonesByWeek(childId, week));
-  }, [childId, week, refreshKey]);
-
-  const handleToggle = (idx) => {
-    milestoneService.toggleMilestone(childId, week, idx);
-    setRecord({ ...milestoneService.getMilestonesByWeek(childId, week) });
-  };
-
-  if (!record) {
-    return (
-      <div style={{ padding: 16, background: colors.soft, borderRadius: 12, textAlign: "center" }}>
-        <p style={{ color: colors.muted, fontSize: 13 }}>No milestones set for Week {week} yet.</p>
-      </div>
-    );
-  }
-
+  useEffect(() => { setRecord(milestoneService.getMilestonesByWeek(childId, week)); }, [childId, week, refreshKey]);
+  const handleToggle = (idx) => { milestoneService.toggleMilestone(childId, week, idx); setRecord({ ...milestoneService.getMilestonesByWeek(childId, week) }); };
+  if (!record) return <div style={{ padding: 16, background: C.soft, borderRadius: 12, textAlign: "center", color: C.muted, fontSize: 13 }}>No milestones for Week {week} yet.</div>;
   const completed = record.milestones.filter(m => m.status === "COMPLETED").length;
-  const total = record.milestones.length;
-
   return (
     <div>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-        <div style={{ fontWeight: 800, color: colors.primary, fontSize: 14 }}>Week {week} Milestones</div>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <Badge color={completed === total ? "green" : "orange"}>{completed}/{total} Done</Badge>
-        </div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+        <div style={{ fontWeight: 800, color: C.primary, fontSize: 14 }}>Week {week} Milestones</div>
+        <Badge color={completed === record.milestones.length ? "green" : "orange"}>{completed}/{record.milestones.length} Done</Badge>
       </div>
-      <ProgressBar value={completed} max={total} color={completed === total ? colors.success : colors.warning} height={6} />
-      <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 10 }}>
+      <ProgressBar value={completed} max={record.milestones.length} color={completed === record.milestones.length ? C.success : C.warning} height={6} />
+      <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
         {record.milestones.map((ms, idx) => (
-          <div
-            key={idx}
-            onClick={() => handleToggle(idx)}
-            style={{
-              display: "flex", gap: 12, alignItems: "flex-start",
-              padding: "12px 14px", borderRadius: 12, cursor: "pointer",
-              background: ms.status === "COMPLETED" ? "#d1fae5" : colors.soft,
-              border: `1.5px solid ${ms.status === "COMPLETED" ? "#6ee7b7" : colors.border}`,
-              transition: "all 0.2s",
-            }}
-          >
-            <div style={{
-              width: 22, height: 22, borderRadius: "50%", flexShrink: 0,
-              background: ms.status === "COMPLETED" ? colors.success : "#fff",
-              border: `2px solid ${ms.status === "COMPLETED" ? colors.success : colors.border}`,
-              display: "flex", alignItems: "center", justifyContent: "center",
-              fontSize: 12, color: "#fff", fontWeight: 900, marginTop: 1,
-            }}>
-              {ms.status === "COMPLETED" ? "✓" : ""}
-            </div>
+          <div key={idx} onClick={() => handleToggle(idx)} style={{ display: "flex", gap: 12, alignItems: "flex-start", padding: "10px 12px", borderRadius: 12, cursor: "pointer", background: ms.status === "COMPLETED" ? "#d1fae5" : C.soft, border: `1.5px solid ${ms.status === "COMPLETED" ? "#6ee7b7" : C.border}`, transition: "all 0.2s" }}>
+            <div style={{ width: 22, height: 22, borderRadius: "50%", flexShrink: 0, background: ms.status === "COMPLETED" ? C.success : "#fff", border: `2px solid ${ms.status === "COMPLETED" ? C.success : C.border}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, color: "#fff", fontWeight: 900 }}>{ms.status === "COMPLETED" ? "✓" : ""}</div>
             <div>
-              <div style={{ fontWeight: 700, fontSize: 13, color: ms.status === "COMPLETED" ? "#065f46" : colors.text, textDecoration: ms.status === "COMPLETED" ? "line-through" : "none" }}>
-                {ms.title}
-              </div>
-              <div style={{ fontSize: 12, color: colors.muted, marginTop: 3 }}>{ms.description}</div>
+              <div style={{ fontWeight: 700, fontSize: 13, color: ms.status === "COMPLETED" ? "#065f46" : C.text, textDecoration: ms.status === "COMPLETED" ? "line-through" : "none" }}>{ms.title}</div>
+              <div style={{ fontSize: 12, color: C.muted, marginTop: 3 }}>{ms.description}</div>
             </div>
           </div>
         ))}
       </div>
-      <p style={{ fontSize: 11, color: colors.muted, marginTop: 10, textAlign: "center" }}>Tap a milestone to toggle completion</p>
     </div>
   );
 };
-
-// ─────────────────────────────────────────────────────────────────────────────
-// NEW COMPONENT: ProgressGraph — Feature 2
-// Recharts line chart showing week vs score progression
-// Maps to GET /api/progress/:childId
-// ─────────────────────────────────────────────────────────────────────────────
 
 const ProgressGraph = ({ childId }) => {
   const data = progressService.getProgressData(childId);
-
-  if (data.length === 0) {
-    return (
-      <div style={{ textAlign: "center", padding: 40, background: colors.soft, borderRadius: 12 }}>
-        <div style={{ fontSize: 40, marginBottom: 12 }}>📈</div>
-        <p style={{ color: colors.muted, fontSize: 14 }}>Progress data will appear here after your first evaluation.</p>
-      </div>
-    );
-  }
-
-  const CustomTooltip = ({ active, payload, label }) => {
-    if (active && payload && payload.length) {
-      return (
-        <div style={{ background: "#fff", border: `1px solid ${colors.border}`, borderRadius: 10, padding: "10px 14px", boxShadow: "0 4px 12px rgba(0,0,0,0.1)" }}>
-          <div style={{ fontWeight: 800, color: colors.primary, marginBottom: 4 }}>Week {label}</div>
-          {payload.map((p, i) => (
-            <div key={i} style={{ fontSize: 13, color: p.color, fontWeight: 700 }}>{p.name}: {p.value}/100</div>
-          ))}
-        </div>
-      );
-    }
-    return null;
-  };
-
+  if (data.length === 0) return <div style={{ textAlign: "center", padding: 40, background: C.soft, borderRadius: 12, color: C.muted }}>📈 Progress data will appear after your first evaluation.</div>;
+  const Tip = ({ active, payload, label }) => active && payload?.length ? (
+    <div style={{ background: "#fff", border: `1px solid ${C.border}`, borderRadius: 10, padding: "10px 14px", boxShadow: "0 4px 12px rgba(0,0,0,0.1)" }}>
+      <div style={{ fontWeight: 800, color: C.primary, marginBottom: 4 }}>Week {label}</div>
+      {payload.map((p, i) => <div key={i} style={{ fontSize: 13, color: p.color, fontWeight: 700 }}>{p.name}: {p.value}/100</div>)}
+    </div>
+  ) : null;
   return (
     <div>
-      <div style={{ marginBottom: 16, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <div style={{ fontWeight: 800, color: colors.primary }}>Score Progression</div>
+      <div style={{ marginBottom: 12, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ fontWeight: 800, color: C.primary }}>Score Progression</div>
         <div style={{ display: "flex", gap: 16, fontSize: 12 }}>
-          <span style={{ color: colors.accent, fontWeight: 700 }}>● Assessments</span>
-          <span style={{ color: colors.secondary, fontWeight: 700 }}>● Evaluations</span>
+          <span style={{ color: C.accent, fontWeight: 700 }}>● Assessments</span>
+          <span style={{ color: C.secondary, fontWeight: 700 }}>● Evaluations</span>
         </div>
       </div>
-      <ResponsiveContainer width="100%" height={220}>
+      <ResponsiveContainer width="100%" height={200}>
         <LineChart data={data} margin={{ top: 5, right: 10, bottom: 5, left: 0 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke={colors.border} />
-          <XAxis dataKey="week" tick={{ fontSize: 12, fill: colors.muted }} tickFormatter={(v) => `W${v}`} />
-          <YAxis domain={[0, 100]} tick={{ fontSize: 12, fill: colors.muted }} tickFormatter={(v) => `${v}`} />
-          <Tooltip content={<CustomTooltip />} />
-          <ReferenceLine y={70} stroke="#2db87a" strokeDasharray="4 4" label={{ value: "Target", fontSize: 11, fill: "#2db87a", position: "insideRight" }} />
-          <Line type="monotone" dataKey="score" stroke={colors.accent} strokeWidth={2.5} dot={{ r: 5, fill: colors.accent }} name="Score" />
-          <Line type="monotone" dataKey="evalScore" stroke={colors.secondary} strokeWidth={2} strokeDasharray="5 5" dot={{ r: 4, fill: colors.secondary }} name="Eval Score" />
+          <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
+          <XAxis dataKey="week" tick={{ fontSize: 12, fill: C.muted }} tickFormatter={v => `W${v}`} />
+          <YAxis domain={[0, 100]} tick={{ fontSize: 12, fill: C.muted }} />
+          <Tooltip content={<Tip />} />
+          <ReferenceLine y={70} stroke="#2db87a" strokeDasharray="4 4" />
+          <Line type="monotone" dataKey="score"     stroke={C.accent}     strokeWidth={2.5} dot={{ r: 5, fill: C.accent }}     name="Score" />
+          <Line type="monotone" dataKey="evalScore" stroke={C.secondary}  strokeWidth={2}   dot={{ r: 4, fill: C.secondary }}  name="Eval" strokeDasharray="5 5" />
         </LineChart>
       </ResponsiveContainer>
-      <div style={{ display: "flex", gap: 12, marginTop: 14, flexWrap: "wrap" }}>
-        {data.map(d => (
-          <div key={d.week} style={{ background: colors.soft, borderRadius: 10, padding: "8px 12px", textAlign: "center" }}>
-            <div style={{ fontSize: 11, color: colors.muted, fontWeight: 700 }}>Week {d.week}</div>
-            <div style={{ fontSize: 16, fontWeight: 900, color: colors.primary }}>{d.score}</div>
-            {d.evalScore && <div style={{ fontSize: 11, color: colors.secondary, fontWeight: 700 }}>Eval: {d.evalScore}</div>}
-          </div>
-        ))}
-      </div>
     </div>
   );
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// NEW COMPONENT: WeeklySummaryCard — Feature 3
-// Shows English/Tamil toggle for weekly summary
-// ─────────────────────────────────────────────────────────────────────────────
-
-const WeeklySummaryCard = ({ childId }) => {
-  const [lang, setLang] = useState("en"); // "en" | "ta"
+/**
+ * Weekly Summary Card — Language Toggle
+ * v4 FIX: Only shows EN and TA buttons (both confirmed working).
+ * Falls back to English if Tamil content is missing.
+ */
+const WeeklySummaryCard = ({ childId, preferredLanguage }) => {
+  const defaultCode = languageEngine.getLangCode(preferredLanguage);
+  const [lang, setLang] = useState(defaultCode);
   const summaries = summaryService.getSummariesByChild(childId);
-
-  if (summaries.length === 0) {
-    return (
-      <div style={{ textAlign: "center", padding: 32, background: colors.soft, borderRadius: 12 }}>
-        <div style={{ fontSize: 36, marginBottom: 10 }}>📝</div>
-        <p style={{ color: colors.muted, fontSize: 14 }}>Weekly summaries will appear here after your first evaluation.</p>
-      </div>
-    );
-  }
-
+  if (summaries.length === 0) return <div style={{ textAlign: "center", padding: 32, background: C.soft, borderRadius: 12, color: C.muted }}>📝 Summaries will appear after your first weekly evaluation.</div>;
   return (
     <div>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
-        <div style={{ fontWeight: 800, color: colors.primary }}>Learning Summaries</div>
-        {/* Language Toggle */}
-        <div style={{ display: "flex", background: colors.soft, borderRadius: 10, padding: 3, gap: 2 }}>
-          {[["en", "🇬🇧 English"], ["ta", "🇮🇳 தமிழ்"]].map(([code, label]) => (
-            <button key={code} onClick={() => setLang(code)} style={{ padding: "6px 14px", border: "none", borderRadius: 8, cursor: "pointer", fontFamily: "Nunito", fontWeight: 700, fontSize: 12, background: lang === code ? colors.primary : "transparent", color: lang === code ? "#fff" : colors.muted, transition: "all 0.2s" }}>
-              {label}
+      {/* Language Toggle — EN and TA only (v4 language fix) */}
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ fontWeight: 800, color: C.primary, marginBottom: 10 }}>Select Language</div>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {SUPPORTED_LANGUAGES.map(l => (
+            <button key={l.code} onClick={() => setLang(l.code)}
+              style={{ padding: "6px 14px", border: `2px solid ${lang === l.code ? C.primary : C.border}`, borderRadius: 20, cursor: "pointer", fontFamily: "Nunito", fontWeight: 700, fontSize: 13, background: lang === l.code ? C.primary : "#fff", color: lang === l.code ? "#fff" : C.text, transition: "all 0.2s" }}>
+              {l.flag} {l.nativeName}
             </button>
           ))}
         </div>
       </div>
-
       {summaries.map(s => (
         <div key={s.id} style={{ marginBottom: 16 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
             <Badge color="blue">Week {s.week}</Badge>
-            <span style={{ fontSize: 12, color: colors.muted }}>{s.createdAt}</span>
+            <span style={{ fontSize: 12, color: C.muted }}>{s.createdAt}</span>
           </div>
-          <div style={{
-            background: lang === "ta" ? "#fdf4ff" : "#f0f9ff",
-            border: `1px solid ${lang === "ta" ? "#e9d5ff" : "#bae6fd"}`,
-            borderRadius: 12, padding: 16,
-          }}>
-            <p style={{
-              fontSize: lang === "ta" ? 15 : 14,
-              color: colors.text, lineHeight: 1.8,
-              fontFamily: lang === "ta" ? "'Noto Sans Tamil', 'Nunito', sans-serif" : "inherit"
-            }}>
-              {lang === "en" ? s.summaryEnglish : s.summaryRegional}
+          <div style={{ background: lang === "ta" ? "#fdf4ff" : "#f0f9ff", border: `1px solid ${lang === "ta" ? "#e9d5ff" : "#bae6fd"}`, borderRadius: 12, padding: 16 }}>
+            <p style={{ fontSize: 14, color: C.text, lineHeight: 1.9 }}>
+              {s.summaries?.[lang] ?? s.summaries?.en ?? "Summary not available."}
             </p>
           </div>
         </div>
@@ -1034,347 +1308,197 @@ const WeeklySummaryCard = ({ childId }) => {
   );
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// EXISTING COMPONENT: InitialAssessmentFlow (v1 — preserved, not modified)
-// ─────────────────────────────────────────────────────────────────────────────
-
-const InitialAssessmentFlow = ({ parent, onComplete }) => {
-  const [phase, setPhase] = useState("intro");
-  const [questions, setQuestions] = useState([]);
-  const [answers, setAnswers] = useState({});
-  const [result, setResult] = useState(null);
-  const [week1Plan, setWeek1Plan] = useState(null);
-  const [currentQ, setCurrentQ] = useState(0);
-  const [planLoading, setPlanLoading] = useState(false);
-  const educator = assessmentService.getEducatorById(parent.assignedEducatorID);
-
-  const loadQuestions = async () => {
-    setPhase("loading");
-    const qs = await aiService.generateInitialTest(parent.age, parent.disabilityType);
-    setQuestions(qs); setPhase("questions");
-  };
-  const handleAnswer = (qId, answer) => setAnswers(prev => ({ ...prev, [qId]: answer }));
-  const handleNextQuestion = () => { if (currentQ < questions.length - 1) setCurrentQ(c => c + 1); else submitAssessment(); };
-  const submitAssessment = () => {
-    const answersArr = questions.map(q => ({ questionId: q.id, answer: answers[q.id] || q.options[q.options.length - 1], score: q.scoring?.[answers[q.id]] ?? 0 }));
-    const { totalScore, level } = aiService.evaluateInitialAssessment(answersArr, questions);
-    const record = assessmentService.saveInitialAssessment(parent.id, questions, answersArr, totalScore, level, parent.disabilityType, parent.age);
-    setResult({ totalScore, level, record }); setPhase("result");
-  };
-  const generatePlan = async () => {
-    setPlanLoading(true);
-    const planData = await aiService.generateWeek1Plan(parent, result.totalScore, result.level);
-    const savedPlan = assessmentService.saveWeek1Plan(parent.id, educator?.id || "edu1", planData, result.totalScore, result.level);
-
-    // Feature 1 Enhancement: Generate milestones alongside week 1 plan
-    const milestones = await aiService.generateMilestones(savedPlan, parent);
-    milestoneService.saveMilestones(parent.id, 1, milestones);
-
-    setWeek1Plan(savedPlan); setPlanLoading(false); setPhase("plan");
-  };
-
-  const levelDesc = {
-    LOW: "Your child needs foundational support. We'll start with structured, simple activities and build up gradually.",
-    MEDIUM: "Your child shows good baseline skills. The plan will focus on consolidating and expanding capabilities.",
-    HIGH: "Your child demonstrates strong foundational skills. We'll work on advanced independence and social learning.",
-  };
-
+/** IEP Viewer — shown in parent dashboard "My IEP" tab */
+const IEPViewer = ({ userId, childName }) => {
+  const iep       = educationPlanService.getPlanByUser(userId);
+  const multiAssmt = multiDomainService.getAssessmentByUser(userId);
+  if (!iep) return (
+    <div style={{ textAlign: "center", padding: 40, background: C.soft, borderRadius: 14 }}>
+      <div style={{ fontSize: 48, marginBottom: 12 }}>🎓</div>
+      <p style={{ color: C.muted }}>No IEP yet. Complete the multi-domain assessment to generate {childName}'s personalised plan.</p>
+    </div>
+  );
   return (
-    <div style={{ minHeight: "100vh", background: colors.gradient, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
-      <style>{globalStyle}</style>
-      <div className="fade-in" style={{ width: "100%", maxWidth: 580 }}>
-        {phase === "intro" && (
-          <Card style={{ padding: 36, textAlign: "center" }}>
-            <div style={{ fontSize: 52, marginBottom: 16 }}>🧩</div>
-            <h2 style={{ fontFamily: "DM Serif Display", fontSize: 28, color: colors.primary, marginBottom: 8 }}>Welcome to EduPath!</h2>
-            <p style={{ color: colors.muted, marginBottom: 8, fontSize: 15 }}>Hello, {parent.parentName}!</p>
+    <div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 20, flexWrap: "wrap" }}>
+        <Badge color="blue">{iep.gradeLabel}</Badge>
+        <Badge color={iep.overallLevel === "HIGH" ? "green" : iep.overallLevel === "MEDIUM" ? "orange" : "red"}>{iep.overallLevel} Ability Level</Badge>
+        <Badge color="purple">AI Generated</Badge>
+        <Badge color="indigo">{new Date(iep.generatedAt).toLocaleDateString()}</Badge>
+      </div>
 
-            {/* Feature 4: Educator assignment status */}
-            {parent.assignedEducatorID ? (
-              <Alert type="success">Matched with {assessmentService.getEducatorById(parent.assignedEducatorID)?.name} — {parent.disabilityType} Specialist</Alert>
-            ) : (
-              <Alert type="warning">Please wait while we find a suitable educator for your child. In the meantime, let's complete the initial assessment.</Alert>
-            )}
-
-            <p style={{ color: colors.text, marginBottom: 24, lineHeight: 1.7 }}>
-              Before we create <strong>{parent.childName}'s</strong> personalised learning plan, we need to understand their current abilities through a short <strong>initial assessment</strong>.
-            </p>
-            <div style={{ background: colors.soft, borderRadius: 12, padding: 18, marginBottom: 24, textAlign: "left" }}>
-              <div style={{ fontWeight: 800, color: colors.primary, marginBottom: 10 }}>What happens next:</div>
-              {["6 short questions about your child's current abilities", "AI analyses responses and classifies ability level", "Personalised Week 1 plan generated instantly", "Milestones set for the week"].map((s, i) => (
-                <div key={i} style={{ display: "flex", gap: 10, marginBottom: 8, alignItems: "flex-start" }}>
-                  <span style={{ background: colors.accent, color: "#fff", borderRadius: "50%", width: 22, height: 22, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 800, flexShrink: 0 }}>{i + 1}</span>
-                  <span style={{ fontSize: 14, color: colors.text }}>{s}</span>
-                </div>
-              ))}
-            </div>
-            <Button onClick={loadQuestions} size="lg" style={{ width: "100%" }}>Begin Assessment →</Button>
-          </Card>
-        )}
-
-        {phase === "loading" && (
-          <Card style={{ padding: 48, textAlign: "center" }}>
-            <div className="pulse" style={{ fontSize: 44, marginBottom: 16 }}>🤖</div>
-            <p style={{ fontFamily: "DM Serif Display", fontSize: 20, color: colors.primary }}>Preparing assessment questions…</p>
-            <div style={{ marginTop: 20, display: "flex", justifyContent: "center" }}><Spinner size={32} /></div>
-          </Card>
-        )}
-
-        {phase === "questions" && questions.length > 0 && (
-          <Card style={{ padding: 32 }}>
-            <div style={{ marginBottom: 20 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8, fontSize: 13, fontWeight: 700 }}>
-                <span style={{ color: colors.muted }}>Question {currentQ + 1} of {questions.length}</span>
-                <Badge color="blue">{questions[currentQ].category}</Badge>
-              </div>
-              <ProgressBar value={currentQ + 1} max={questions.length} />
-            </div>
-            <h3 style={{ fontFamily: "DM Serif Display", fontSize: 20, color: colors.primary, marginBottom: 20, lineHeight: 1.4 }}>{questions[currentQ].text}</h3>
-            <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 24 }}>
-              {questions[currentQ].options.map(opt => (
-                <button key={opt} onClick={() => handleAnswer(questions[currentQ].id, opt)}
-                  style={{ padding: "12px 18px", borderRadius: 12, border: `2px solid ${answers[questions[currentQ].id] === opt ? colors.primary : colors.border}`, background: answers[questions[currentQ].id] === opt ? colors.soft : "#fff", color: answers[questions[currentQ].id] === opt ? colors.primary : colors.text, fontFamily: "Nunito", fontWeight: answers[questions[currentQ].id] === opt ? 800 : 600, fontSize: 14, textAlign: "left", cursor: "pointer", transition: "all 0.15s" }}>
-                  {answers[questions[currentQ].id] === opt ? "✓ " : ""}{opt}
-                </button>
-              ))}
-            </div>
-            <Button onClick={handleNextQuestion} disabled={!answers[questions[currentQ].id]} size="lg" style={{ width: "100%" }}>
-              {currentQ < questions.length - 1 ? "Next Question →" : "Submit Assessment →"}
-            </Button>
-          </Card>
-        )}
-
-        {phase === "result" && result && (
-          <Card style={{ padding: 36 }} className="fade-in">
-            <div style={{ textAlign: "center", marginBottom: 28 }}>
-              <div style={{ fontSize: 52, marginBottom: 12 }}>📊</div>
-              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: colors.primary, marginBottom: 8 }}>Assessment Complete!</h2>
-              <p style={{ color: colors.muted, fontSize: 14 }}>Here are {parent.childName}'s initial results</p>
-            </div>
-            <div style={{ background: colors.soft, borderRadius: 14, padding: 24, textAlign: "center", marginBottom: 24 }}>
-              <div style={{ fontSize: 48, fontWeight: 900, color: colors.primary, marginBottom: 8 }}>{result.totalScore}<span style={{ fontSize: 22, fontWeight: 700, color: colors.muted }}>/100</span></div>
-              <ScoreBadge score={result.totalScore} />
-              <p style={{ marginTop: 12, color: colors.text, fontSize: 14, lineHeight: 1.7 }}>{levelDesc[result.level]}</p>
-            </div>
-            <Button onClick={generatePlan} disabled={planLoading} size="lg" style={{ width: "100%" }}>
-              {planLoading ? <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}><Spinner size={18} color="#fff" /> Generating Week 1 Plan + Milestones…</div> : "🤖 Generate Week 1 Plan + Milestones →"}
-            </Button>
-          </Card>
-        )}
-
-        {phase === "plan" && week1Plan && (
-          <div className="fade-in">
-            <Card style={{ padding: 32, marginBottom: 16 }}>
-              <div style={{ textAlign: "center", marginBottom: 24 }}>
-                <div style={{ fontSize: 48, marginBottom: 10 }}>🎉</div>
-                <h2 style={{ fontFamily: "DM Serif Display", fontSize: 24, color: colors.primary, marginBottom: 6 }}>Week 1 Plan Ready!</h2>
-              </div>
-              <div style={{ background: "#f0fdf4", borderRadius: 12, padding: 16, marginBottom: 20, borderLeft: `4px solid ${colors.success}` }}>
-                <div style={{ fontWeight: 800, color: colors.success, marginBottom: 6, fontSize: 13 }}>🎯 WEEKLY GOAL</div>
-                <p style={{ fontSize: 14, color: colors.text, lineHeight: 1.6 }}>{week1Plan.learningOutcome}</p>
-              </div>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(170px, 1fr))", gap: 10, marginBottom: 20 }}>
-                {week1Plan.weeklyPlan.map((day, i) => (
-                  <div key={i} style={{ padding: 14, background: ["#eff6ff","#f0fdf4","#fffbeb","#fdf4ff","#fef2f2"][i], borderRadius: 12 }}>
-                    <div style={{ fontWeight: 800, color: colors.secondary, fontSize: 12, marginBottom: 6 }}>{day.day}</div>
-                    <div style={{ fontSize: 12, fontWeight: 700, color: colors.text, marginBottom: 4 }}>{day.activity}</div>
-                    <div style={{ fontSize: 11, color: colors.muted }}>🎯 {day.goal}</div>
-                    <div style={{ fontSize: 11, color: colors.accent, marginTop: 3 }}>⏱ {day.duration}</div>
-                  </div>
-                ))}
-              </div>
-              {/* Feature 1: Show milestones preview */}
-              <div style={{ background: "#fffbeb", borderRadius: 12, padding: 14, marginBottom: 16 }}>
-                <div style={{ fontWeight: 800, color: "#92400e", fontSize: 13, marginBottom: 8 }}>🏁 Week 1 Milestones</div>
-                {(milestoneService.getMilestonesByWeek(parent.id, 1)?.milestones || []).map((ms, i) => (
-                  <div key={i} style={{ fontSize: 12, color: "#78350f", marginBottom: 6, display: "flex", gap: 8 }}>
-                    <span>○</span><span>{ms.title}</span>
-                  </div>
-                ))}
-              </div>
-              <Button onClick={() => onComplete()} size="lg" style={{ width: "100%" }}>Go to Dashboard →</Button>
-            </Card>
+      {/* Assessment profile */}
+      {multiAssmt && (
+        <Card style={{ marginBottom: 20 }}>
+          <div style={{ fontWeight: 800, color: C.primary, marginBottom: 14 }}>📊 Assessment Profile</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 10 }}>
+            {[
+              { key: "iqScore",            label: "IQ & Reasoning", icon: "🧠", color: C.domain.iq },
+              { key: "cognitiveScore",     label: "Cognitive",       icon: "💡", color: C.domain.cognitive },
+              { key: "motorScore",         label: "Motor",           icon: "✋", color: C.domain.motor },
+              { key: "communicationScore", label: "Communication",   icon: "💬", color: C.domain.communication },
+            ].map(d => <DomainScoreCard key={d.key} domain={d.label} score={multiAssmt[d.key] ?? 0} icon={d.icon} color={d.color} />)}
           </div>
-        )}
+        </Card>
+      )}
+
+      {/* Modified curriculum */}
+      <Card style={{ marginBottom: 16 }}>
+        <div style={{ fontWeight: 800, color: C.primary, marginBottom: 14 }}>📚 Modified Curriculum</div>
+        {(iep.subjects ?? []).map((s, i) => (
+          <div key={i} style={{ marginBottom: 12, padding: 14, background: C.soft, borderRadius: 12 }}>
+            <div style={{ fontWeight: 800, color: C.primary, marginBottom: 6 }}>{s.icon} {s.name}</div>
+            <div style={{ fontSize: 12, color: C.muted, marginBottom: 4 }}>📖 Grade standard: {s.gradeGoal}</div>
+            <div style={{ fontSize: 13, color: C.success, fontWeight: 700 }}>✏️ Modified goal: {s.modifiedGoal}</div>
+          </div>
+        ))}
+      </Card>
+
+      {/* Goals */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 16 }}>
+        <Card style={{ background: "#eff6ff" }}>
+          <div style={{ fontWeight: 800, color: "#1d4ed8", fontSize: 13, marginBottom: 10 }}>🎯 Academic Goals</div>
+          {(iep.goals?.academic ?? []).map((g, i) => <div key={i} style={{ fontSize: 12, color: "#1e40af", marginBottom: 6 }}>• {g}</div>)}
+        </Card>
+        <Card style={{ background: "#f0fdf4" }}>
+          <div style={{ fontWeight: 800, color: "#065f46", fontSize: 13, marginBottom: 10 }}>⚡ Functional Goals</div>
+          {(iep.goals?.functional ?? []).map((g, i) => <div key={i} style={{ fontSize: 12, color: "#065f46", marginBottom: 6 }}>• {g}</div>)}
+        </Card>
+      </div>
+
+      {/* Recommendations + Accommodations */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+        <Card style={{ background: "#fffbeb" }}>
+          <div style={{ fontWeight: 800, color: "#92400e", fontSize: 13, marginBottom: 10 }}>💡 Recommendations</div>
+          {(iep.recommendations ?? []).map((r, i) => <div key={i} style={{ fontSize: 12, color: "#78350f", marginBottom: 6 }}>• {r}</div>)}
+        </Card>
+        <Card style={{ background: "#fdf4ff" }}>
+          <div style={{ fontWeight: 800, color: "#5b21b6", fontSize: 13, marginBottom: 10 }}>🛡 Accommodations</div>
+          {(iep.accommodations ?? []).map((a, i) => <div key={i} style={{ fontSize: 12, color: "#5b21b6", marginBottom: 6 }}>• {a}</div>)}
+        </Card>
       </div>
     </div>
   );
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// EXISTING COMPONENT: WeeklyEvaluationFlow — Extended for Feature 1, 3, 5
-// Changes: After evaluation, auto-updates milestones + generates summary + creates milestones for next week
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Weekly Evaluation Flow ──────────────────────────────────────────────────
 
 const WeeklyEvaluationFlow = ({ parent, iepPlan, onComplete, onClose }) => {
-  const [phase, setPhase] = useState("intro");
+  const [phase, setPhase]       = useState("intro");
   const [questions, setQuestions] = useState([]);
-  const [answers, setAnswers] = useState({});
+  const [answers, setAnswers]   = useState({});
   const [currentQ, setCurrentQ] = useState(0);
   const [evalResult, setEvalResult] = useState(null);
   const educator = assessmentService.getEducatorById(parent.assignedEducatorID);
 
   const loadQuestions = async () => { setPhase("loading"); const qs = await aiService.generateWeeklyEvalTest(iepPlan, parent); setQuestions(qs); setPhase("questions"); };
-  const handleAnswer = (qId, answer) => setAnswers(p => ({ ...p, [qId]: answer }));
   const handleNext = () => { if (currentQ < questions.length - 1) setCurrentQ(c => c + 1); else submitEvaluation(); };
 
   const submitEvaluation = async () => {
     setPhase("evaluating");
-    const answersArr = questions.map(q => {
-      const ans = answers[q.id] || q.options[q.options.length - 1];
-      return { questionId: q.id, answer: ans, isCorrect: (q.scoring?.[ans] ?? 0) >= 2 };
-    });
+    const answersArr = questions.map(q => { const ans = answers[q.id] ?? q.options[q.options.length - 1]; return { questionId: q.id, answer: ans, isCorrect: (q.scoring?.[ans] ?? 0) >= 2 }; });
     const earned = answersArr.reduce((s, a) => { const q = questions.find(q => q.id === a.questionId); return s + (q?.scoring?.[a.answer] ?? 0); }, 0);
     const score = Math.round((earned / (questions.length * 3)) * 100);
-    const prevScore = iepPlan.previousScore || 50;
-
-    // AI Decision
+    const prevScore = iepPlan.previousScore ?? 50;
     const aiDecision = await aiService.makeProgressDecision(score, iepPlan.targetScore, prevScore, iepPlan, parent);
-
-    // Save evaluation record
-    const evalRecord = assessmentService.saveWeeklyEvaluation(parent.id, educator?.id || "edu1", iepPlan.weekNumber, iepPlan.id, questions, answersArr, score, prevScore, aiDecision);
-
-    // Feature 1: Auto-update milestones based on AI decision
+    assessmentService.saveWeeklyEvaluation(parent.id, educator?.id ?? "edu1", iepPlan.weekNumber, iepPlan.id, questions, answersArr, score, prevScore, aiDecision);
     milestoneService.updateMilestoneStatus(parent.id, iepPlan.weekNumber, aiDecision.decision);
 
-    // Feature 3: Generate weekly summary in English + Tamil
+    // Generate summary in EN + TA (v4 language fix)
     const evaluation = { score, previousScore: prevScore, improvement: score - prevScore, aiDecision: aiDecision.decision };
-    const { summaryEnglish, summaryRegional } = await aiService.generateWeeklySummary(parent, iepPlan, evaluation);
-    summaryService.saveSummary(parent.id, iepPlan.weekNumber, summaryEnglish, summaryRegional);
+    const summaries = await aiService.generateSummary(parent, iepPlan, evaluation);
+    summaryService.saveSummary(parent.id, iepPlan.weekNumber, summaries);
 
     if (aiDecision.decision === "ADVANCE") {
       assessmentService.updateIEPStatus(iepPlan.id, "Achieved");
-      // Feature 5: Generate next week plan
       const nextPlanData = await aiService.generateNextWeekPlan(parent, iepPlan, { score });
       const nextPlan = assessmentService.saveNextWeekPlan(parent.id, educator?.id, iepPlan.weekNumber + 1, nextPlanData, score);
-      // Feature 1 + 5: Generate milestones for next week automatically
       const nextMilestones = await aiService.generateMilestones(nextPlan, parent);
       milestoneService.saveMilestones(parent.id, iepPlan.weekNumber + 1, nextMilestones);
     } else {
       assessmentService.updateIEPStatus(iepPlan.id, "Not Achieved");
       assessmentService.modifyIEPPlan(iepPlan.id, aiDecision.modifications);
     }
-
     setEvalResult({ score, aiDecision, improvement: score - prevScore });
     setPhase("result");
   };
 
   return (
-    <div style={{ minHeight: "100vh", background: colors.gradient, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
-      <style>{globalStyle}</style>
+    <div style={{ minHeight: "100vh", background: C.gradient, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <style>{G}</style>
       <div className="fade-in" style={{ width: "100%", maxWidth: 560 }}>
         {phase === "intro" && (
           <Card style={{ padding: 32 }}>
-            <div style={{ textAlign: "center", marginBottom: 24 }}>
+            <div style={{ textAlign: "center", marginBottom: 20 }}>
               <div style={{ fontSize: 48, marginBottom: 10 }}>📝</div>
-              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 24, color: colors.primary }}>Week {iepPlan.weekNumber} Evaluation</h2>
-              <p style={{ color: colors.muted, marginTop: 8, fontSize: 14 }}>Let's see how {parent.childName} progressed this week!</p>
+              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 24, color: C.primary }}>Week {iepPlan.weekNumber} Evaluation</h2>
+              <p style={{ color: C.muted, marginTop: 8, fontSize: 14 }}>How did {parent.childName} do this week?</p>
             </div>
-            <div style={{ background: colors.soft, borderRadius: 12, padding: 16, marginBottom: 20 }}>
-              <div style={{ fontWeight: 800, color: colors.primary, marginBottom: 6, fontSize: 13 }}>THIS WEEK'S GOAL</div>
-              <p style={{ fontSize: 14, color: colors.text }}>{iepPlan.learningOutcome}</p>
-              <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
-                <span style={{ fontSize: 13, color: colors.muted }}>Target: <strong style={{ color: colors.primary }}>{iepPlan.targetScore}/100</strong></span>
-                <span style={{ fontSize: 13, color: colors.muted }}>Previous: <strong style={{ color: colors.primary }}>{iepPlan.previousScore}/100</strong></span>
-              </div>
-            </div>
-            <Alert type="info">After this evaluation, AI will update milestones and generate a Tamil summary for you.</Alert>
+            <Alert type="info">After evaluation, a summary will be generated in English and Tamil.</Alert>
             <div style={{ display: "flex", gap: 12 }}>
               <Button onClick={onClose} variant="outline" style={{ flex: 1 }}>Back</Button>
               <Button onClick={loadQuestions} style={{ flex: 2 }}>Start Evaluation →</Button>
             </div>
           </Card>
         )}
-
         {phase === "loading" && (
           <Card style={{ padding: 48, textAlign: "center" }}>
             <div className="pulse" style={{ fontSize: 44, marginBottom: 16 }}>🤖</div>
-            <p style={{ fontFamily: "DM Serif Display", fontSize: 20, color: colors.primary }}>Generating evaluation questions…</p>
+            <p style={{ fontFamily: "DM Serif Display", fontSize: 20, color: C.primary }}>Generating questions…</p>
             <div style={{ marginTop: 20, display: "flex", justifyContent: "center" }}><Spinner size={32} /></div>
           </Card>
         )}
-
         {phase === "questions" && questions.length > 0 && (
           <Card style={{ padding: 32 }}>
             <div style={{ marginBottom: 20 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8, fontSize: 13, fontWeight: 700 }}>
-                <span style={{ color: colors.muted }}>Question {currentQ + 1} of {questions.length}</span>
-                <Badge color="purple">Week {iepPlan.weekNumber} Eval</Badge>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8, fontSize: 13 }}>
+                <span style={{ color: C.muted, fontWeight: 700 }}>Q{currentQ + 1}/{questions.length}</span>
+                <Badge color="purple">Week {iepPlan.weekNumber}</Badge>
               </div>
               <ProgressBar value={currentQ + 1} max={questions.length} />
             </div>
-            <div style={{ background: colors.soft, borderRadius: 10, padding: 12, marginBottom: 16, fontSize: 12, color: colors.muted, fontWeight: 700 }}>
-              📌 Related to: {questions[currentQ].relatedActivity}
-            </div>
-            <h3 style={{ fontFamily: "DM Serif Display", fontSize: 19, color: colors.primary, marginBottom: 20, lineHeight: 1.4 }}>
-              {questions[currentQ].text}
-            </h3>
+            <h3 style={{ fontFamily: "DM Serif Display", fontSize: 18, color: C.primary, marginBottom: 20, lineHeight: 1.5 }}>{questions[currentQ].text}</h3>
             <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 24 }}>
               {questions[currentQ].options.map(opt => (
-                <button key={opt} onClick={() => handleAnswer(questions[currentQ].id, opt)}
-                  style={{ padding: "12px 18px", borderRadius: 12, border: `2px solid ${answers[questions[currentQ].id] === opt ? colors.accent : colors.border}`, background: answers[questions[currentQ].id] === opt ? "#f0fdfa" : "#fff", color: answers[questions[currentQ].id] === opt ? "#0f766e" : colors.text, fontFamily: "Nunito", fontWeight: answers[questions[currentQ].id] === opt ? 800 : 600, fontSize: 14, textAlign: "left", cursor: "pointer", transition: "all 0.15s" }}>
+                <button key={opt} onClick={() => setAnswers(p => ({ ...p, [questions[currentQ].id]: opt }))}
+                  style={{ padding: "12px 18px", borderRadius: 12, border: `2px solid ${answers[questions[currentQ].id] === opt ? C.accent : C.border}`, background: answers[questions[currentQ].id] === opt ? "#f0fdfa" : "#fff", color: answers[questions[currentQ].id] === opt ? "#0f766e" : C.text, fontFamily: "Nunito", fontWeight: answers[questions[currentQ].id] === opt ? 800 : 600, fontSize: 14, textAlign: "left", cursor: "pointer" }}>
                   {answers[questions[currentQ].id] === opt ? "✓ " : ""}{opt}
                 </button>
               ))}
             </div>
-            <Button onClick={handleNext} disabled={!answers[questions[currentQ].id]} size="lg" style={{ width: "100%" }}>
-              {currentQ < questions.length - 1 ? "Next →" : "Submit →"}
-            </Button>
+            <Button onClick={handleNext} disabled={!answers[questions[currentQ].id]} size="lg" style={{ width: "100%" }}>{currentQ < questions.length - 1 ? "Next →" : "Submit →"}</Button>
           </Card>
         )}
-
         {phase === "evaluating" && (
           <Card style={{ padding: 48, textAlign: "center" }}>
             <div className="pulse" style={{ fontSize: 44, marginBottom: 16 }}>🤖</div>
-            <p style={{ fontFamily: "DM Serif Display", fontSize: 20, color: colors.primary }}>AI is evaluating results…</p>
-            <p style={{ color: colors.muted, fontSize: 13, marginTop: 8 }}>Updating milestones · Generating Tamil summary · Planning next week…</p>
+            <p style={{ fontFamily: "DM Serif Display", fontSize: 20, color: C.primary }}>AI evaluating + generating summary in English & Tamil…</p>
             <div style={{ marginTop: 20, display: "flex", justifyContent: "center" }}><Spinner size={32} /></div>
           </Card>
         )}
-
         {phase === "result" && evalResult && (
           <Card style={{ padding: 32 }} className="fade-in">
-            <div style={{ textAlign: "center", marginBottom: 24 }}>
+            <div style={{ textAlign: "center", marginBottom: 20 }}>
               <div style={{ fontSize: 52, marginBottom: 10 }}>{evalResult.aiDecision.decision === "ADVANCE" ? "🎉" : "💪"}</div>
-              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: colors.primary, marginBottom: 6 }}>Week {iepPlan.weekNumber} Complete!</h2>
-            </div>
-            <div style={{ background: colors.soft, borderRadius: 14, padding: 20, textAlign: "center", marginBottom: 20 }}>
-              <div style={{ fontSize: 48, fontWeight: 900, color: colors.primary }}>{evalResult.score}<span style={{ fontSize: 22, color: colors.muted }}>/100</span></div>
-              <div style={{ marginTop: 8, display: "flex", gap: 8, justifyContent: "center" }}>
-                <Badge color={evalResult.aiDecision.decision === "ADVANCE" ? "green" : "orange"}>
-                  {evalResult.aiDecision.decision === "ADVANCE" ? "✅ ADVANCED" : "🔄 PLAN MODIFIED"}
-                </Badge>
-                <Badge color={evalResult.improvement >= 0 ? "green" : "red"}>
-                  {evalResult.improvement >= 0 ? "+" : ""}{evalResult.improvement} pts
-                </Badge>
+              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 24, color: C.primary }}>Week {iepPlan.weekNumber} Done!</h2>
+              <div style={{ marginTop: 10, display: "flex", gap: 8, justifyContent: "center" }}>
+                <Badge color={evalResult.aiDecision.decision === "ADVANCE" ? "green" : "orange"}>{evalResult.aiDecision.decision === "ADVANCE" ? "✅ ADVANCED" : "🔄 MODIFIED"}</Badge>
+                <Badge color={evalResult.improvement >= 0 ? "green" : "red"}>{evalResult.score}/100</Badge>
               </div>
             </div>
-            <div style={{ background: evalResult.aiDecision.decision === "ADVANCE" ? "#d1fae5" : "#ffedd5", borderRadius: 12, padding: 16, marginBottom: 14 }}>
-              <div style={{ fontWeight: 800, fontSize: 13, marginBottom: 6, color: evalResult.aiDecision.decision === "ADVANCE" ? "#065f46" : "#9a3412" }}>🤖 AI Decision</div>
-              <p style={{ fontSize: 13, color: colors.text, lineHeight: 1.6 }}>{evalResult.aiDecision.reasoning}</p>
+            <div style={{ background: evalResult.aiDecision.decision === "ADVANCE" ? "#d1fae5" : "#ffedd5", borderRadius: 12, padding: 14, marginBottom: 14 }}>
+              <p style={{ fontSize: 13, color: C.text, lineHeight: 1.6 }}>{evalResult.aiDecision.reasoning}</p>
             </div>
             {evalResult.aiDecision.encouragementMessage && (
               <div style={{ background: "#f5f3ff", borderRadius: 10, padding: 12, marginBottom: 14, textAlign: "center" }}>
                 <p style={{ fontSize: 14, color: "#5b21b6", fontWeight: 600, fontStyle: "italic" }}>💬 "{evalResult.aiDecision.encouragementMessage}"</p>
               </div>
             )}
-            <div style={{ display: "flex", gap: 8, padding: 12, background: "#d1fae5", borderRadius: 10, marginBottom: 14 }}>
-              <span style={{ fontSize: 14 }}>✅</span>
-              <div>
-                <div style={{ fontWeight: 700, color: "#065f46", fontSize: 13 }}>Milestones Updated</div>
-                <div style={{ fontSize: 12, color: "#065f46" }}>{evalResult.aiDecision.decision === "ADVANCE" ? "All milestones marked COMPLETED" : "Milestones carried forward to revised plan"}</div>
-              </div>
+            <div style={{ display: "flex", gap: 8, padding: 12, background: "#f0fdf4", borderRadius: 10, marginBottom: 16 }}>
+              <span>🌐</span>
+              <div style={{ fontSize: 13, color: "#065f46", fontWeight: 700 }}>Summary generated in English & Tamil — view in the Summaries tab!</div>
             </div>
-            <div style={{ display: "flex", gap: 8, padding: 12, background: "#fdf4ff", borderRadius: 10, marginBottom: 20 }}>
-              <span style={{ fontSize: 14 }}>📝</span>
-              <div>
-                <div style={{ fontWeight: 700, color: "#5b21b6", fontSize: 13 }}>Tamil Summary Generated</div>
-                <div style={{ fontSize: 12, color: "#5b21b6" }}>View in Summaries tab</div>
-              </div>
-            </div>
-            <Button onClick={() => onComplete()} size="lg" style={{ width: "100%" }}>
-              {evalResult.aiDecision.decision === "ADVANCE" ? "🚀 View Week " + (iepPlan.weekNumber + 1) + " Plan →" : "📋 View Updated Plan →"}
-            </Button>
+            <Button onClick={() => onComplete()} size="lg" style={{ width: "100%" }}>Go to Dashboard →</Button>
           </Card>
         )}
       </div>
@@ -1382,87 +1506,110 @@ const WeeklyEvaluationFlow = ({ parent, iepPlan, onComplete, onClose }) => {
   );
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// EXISTING AUTH PAGE (preserved, minor Feature 4 messaging)
-// ─────────────────────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 9 — AUTH PAGE
+// ════════════════════════════════════════════════════════════════════════════════
 
 const AuthPage = ({ onLogin }) => {
-  const [role, setRole] = useState("parent");
-  const [mode, setMode] = useState("login");
-  const [form, setForm] = useState({ email: "", password: "", parentName: "", childName: "", age: "", disabilityType: disabilityTypes[0], preferredLanguage: languages[0], name: "", educatorType: disabilityTypes[0] });
+  const [role, setRole]   = useState("parent");
+  const [mode, setMode]   = useState("login");
+  const [form, setForm]   = useState({ email: "", password: "", parentName: "", childName: "", age: "", disabilityType: disabilityTypes[0], preferredLanguage: "English", name: "", educatorType: disabilityTypes[0] });
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(""); const [success, setSuccess] = useState("");
-  const f = (key) => (val) => setForm(prev => ({ ...prev, [key]: val }));
+  const [error, setError]   = useState("");
+  const [success, setSuccess] = useState("");
+  const f = key => val => setForm(p => ({ ...p, [key]: val }));
 
   const handleSubmit = async () => {
     setError(""); setSuccess(""); setLoading(true);
-    await new Promise(r => setTimeout(r, 700));
+    await new Promise(r => setTimeout(r, 600));
     const res = mode === "login" ? mockAuth.login(form.email, form.password, role) : mockAuth.register(form, role);
     if (res.error) { setError(res.error); setLoading(false); return; }
     if (mode === "register") {
-      let msg = "";
-      if (role === "parent") {
-        // Feature 4: Show educator matching status
-        msg = res.assignedEducator
-          ? `Registered! Child ID: ${res.user.uniqueChildID}. Matched with ${res.assignedEducator.name}.`
-          : `Registered! Child ID: ${res.user.uniqueChildID}. Please wait while we find a suitable educator for your child.`;
-      } else {
-        msg = res.matchedCount > 0
-          ? `Registration successful! Automatically matched with ${res.matchedCount} waiting child(ren).`
-          : "Registration successful!";
-      }
+      const grade = role === "parent" ? curriculumEngine.getGradeFromAge(form.age) : null;
+      const msg = role === "parent"
+        ? `Registered! ${grade ? `Auto-assigned ${curriculumEngine.getSubjectsForGrade(grade).label}.` : ""} ${res.assignedEducator ? `Matched educator: ${res.assignedEducator.name}.` : "Educator matching in progress."}`
+        : res.matchedCount > 0 ? `Registered! Matched ${res.matchedCount} waiting child(ren).` : "Registered successfully!";
       setSuccess(msg);
       setTimeout(() => onLogin(res), 2000);
     } else { onLogin(res); }
     setLoading(false);
   };
 
+  const previewGrade = form.age ? curriculumEngine.getGradeFromAge(form.age) : null;
+  const previewGradeInfo = previewGrade ? curriculumEngine.getSubjectsForGrade(previewGrade) : null;
+
   return (
-    <div style={{ minHeight: "100vh", background: colors.gradient, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
-      <style>{globalStyle}</style>
-      <div className="fade-in" style={{ width: "100%", maxWidth: 460 }}>
+    <div style={{ minHeight: "100vh", background: C.gradient, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <style>{G}</style>
+      <div className="fade-in" style={{ width: "100%", maxWidth: 480 }}>
         <div style={{ textAlign: "center", marginBottom: 32 }}>
-          <div style={{ fontSize: 48, marginBottom: 8 }}>🌱</div>
-          <h1 style={{ fontFamily: "DM Serif Display", fontSize: 32, color: "#fff", marginBottom: 6 }}>EduPath</h1>
-          <p style={{ color: "rgba(255,255,255,0.75)", fontSize: 15 }}>Special Needs Education Plan Generator</p>
+          <div style={{ fontSize: 52, marginBottom: 8 }}>🌱</div>
+          <h1 style={{ fontFamily: "DM Serif Display", fontSize: 34, color: "#fff", marginBottom: 6 }}>EduPath</h1>
+          <p style={{ color: "rgba(255,255,255,0.8)", fontSize: 15 }}>Special Needs Education Plan Generator — v4</p>
         </div>
         <Card style={{ padding: 32 }}>
-          <div style={{ display: "flex", background: colors.soft, borderRadius: 12, padding: 4, marginBottom: 24 }}>
+          {/* Role toggle */}
+          <div style={{ display: "flex", background: C.soft, borderRadius: 12, padding: 4, marginBottom: 24 }}>
             {["parent", "educator"].map(r => (
-              <button key={r} onClick={() => setRole(r)} style={{ flex: 1, padding: "9px 0", border: "none", borderRadius: 10, cursor: "pointer", fontFamily: "Nunito", fontWeight: 700, fontSize: 14, background: role === r ? colors.primary : "transparent", color: role === r ? "#fff" : colors.muted, transition: "all 0.2s" }}>
+              <button key={r} onClick={() => setRole(r)} style={{ flex: 1, padding: "9px 0", border: "none", borderRadius: 10, cursor: "pointer", fontFamily: "Nunito", fontWeight: 700, fontSize: 14, background: role === r ? C.primary : "transparent", color: role === r ? "#fff" : C.muted, transition: "all 0.2s" }}>
                 {r === "parent" ? "👨‍👩‍👧 Parent" : "👩‍🏫 Educator"}
               </button>
             ))}
           </div>
-          <div style={{ display: "flex", gap: 16, marginBottom: 24, borderBottom: `2px solid ${colors.border}`, paddingBottom: 16 }}>
+          {/* Mode toggle */}
+          <div style={{ display: "flex", gap: 16, marginBottom: 24, borderBottom: `2px solid ${C.border}`, paddingBottom: 16 }}>
             {["login", "register"].map(m => (
-              <button key={m} onClick={() => setMode(m)} style={{ border: "none", background: "none", cursor: "pointer", fontFamily: "Nunito", fontWeight: 700, fontSize: 15, color: mode === m ? colors.secondary : colors.muted, borderBottom: mode === m ? `2px solid ${colors.secondary}` : "2px solid transparent", paddingBottom: 4, transition: "all 0.2s" }}>
+              <button key={m} onClick={() => setMode(m)} style={{ border: "none", background: "none", cursor: "pointer", fontFamily: "Nunito", fontWeight: 700, fontSize: 15, color: mode === m ? C.secondary : C.muted, borderBottom: mode === m ? `2px solid ${C.secondary}` : "2px solid transparent", paddingBottom: 4, transition: "all 0.2s" }}>
                 {m === "login" ? "Sign In" : "Register"}
               </button>
             ))}
           </div>
-          {error && <Alert type="error">{error}</Alert>}
+
+          {error   && <Alert type="error">{error}</Alert>}
           {success && <Alert type="success">{success}</Alert>}
-          <Input label="Email" value={form.email} onChange={f("email")} type="email" placeholder="your@email.com" required />
-          <Input label="Password" value={form.password} onChange={f("password")} type="password" placeholder="••••••••" required />
-          {mode === "register" && role === "educator" && (<>
-            <Input label="Full Name" value={form.name} onChange={f("name")} placeholder="Dr. Jane Smith" required />
-            <Input label="Specialization" value={form.educatorType} onChange={f("educatorType")} options={disabilityTypes} required />
-            <Alert type="info">Upon registration, you will be automatically matched with children awaiting an educator of your specialization.</Alert>
-          </>)}
-          {mode === "register" && role === "parent" && (<>
-            <Input label="Your Name" value={form.parentName} onChange={f("parentName")} placeholder="Parent Full Name" required />
-            <Input label="Child's Name" value={form.childName} onChange={f("childName")} placeholder="Child's Name" required />
-            <Input label="Child's Age" value={form.age} onChange={f("age")} type="number" placeholder="e.g. 8" required />
-            <Input label="Disability Type" value={form.disabilityType} onChange={f("disabilityType")} options={disabilityTypes} required />
-            <Input label="Preferred Language" value={form.preferredLanguage} onChange={f("preferredLanguage")} options={languages} required />
-          </>)}
+
+          <Input label="Email"    value={form.email}    onChange={f("email")}    type="email"    placeholder="your@email.com" required />
+          <Input label="Password" value={form.password} onChange={f("password")} type="password" placeholder="••••••••"       required />
+
+          {mode === "register" && role === "educator" && (
+            <>
+              <Input label="Full Name"       value={form.name}         onChange={f("name")}         placeholder="Dr. Jane Smith" required />
+              <Input label="Specialization"  value={form.educatorType} onChange={f("educatorType")} options={disabilityTypes}    required />
+              <Alert type="info">Upon registration you will be auto-matched with waiting children of your specialization.</Alert>
+            </>
+          )}
+
+          {mode === "register" && role === "parent" && (
+            <>
+              <Input label="Your Name"         value={form.parentName}        onChange={f("parentName")}        placeholder="Parent Full Name"  required />
+              <Input label="Child's Name"      value={form.childName}         onChange={f("childName")}         placeholder="Child's Name"      required />
+              <Input label="Child's Age"       value={form.age}               onChange={f("age")}               type="number" placeholder="e.g. 8" required />
+              <Input label="Disability Type"   value={form.disabilityType}    onChange={f("disabilityType")}    options={disabilityTypes}       required />
+              {/* v4 FIX: Only English and Tamil options shown */}
+              <Input label="Preferred Language" value={form.preferredLanguage} onChange={f("preferredLanguage")} options={SUPPORTED_LANGUAGES.map(l => ({ value: l.label, label: `${l.flag} ${l.label} (${l.nativeName})` }))} required />
+              {/* Live grade preview */}
+              {previewGradeInfo && (
+                <div style={{ marginTop: -6, marginBottom: 14, padding: "10px 14px", background: "#eff6ff", borderRadius: 10, fontSize: 12, color: "#1d4ed8", fontWeight: 700 }}>
+                  📚 Age {form.age} → <strong>{previewGradeInfo.label}</strong> ({curriculumEngine.getAgeRangeForGrade(previewGrade)}) — subjects: {previewGradeInfo.subjects.map(s => s.name).join(", ")}
+                </div>
+              )}
+            </>
+          )}
+
           <Button onClick={handleSubmit} disabled={loading} style={{ width: "100%", marginTop: 8 }} size="lg">
-            {loading ? <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}><Spinner size={18} color="#fff" /> Processing...</div> : mode === "login" ? "Sign In →" : "Create Account →"}
+            {loading
+              ? <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}><Spinner size={18} color="#fff" />Processing…</div>
+              : mode === "login" ? "Sign In →" : "Create Account →"}
           </Button>
+
           {mode === "login" && (
-            <div style={{ marginTop: 20, padding: 14, background: colors.soft, borderRadius: 10, fontSize: 12, color: colors.muted }}>
-              <strong style={{ color: colors.primary }}>Demo:</strong> Parent: meera@parent.com / pass123 &nbsp;|&nbsp; Educator: priya@edu.com / pass123
+            <div style={{ marginTop: 20, padding: 14, background: C.soft, borderRadius: 10, fontSize: 12, color: C.muted }}>
+              <strong style={{ color: C.primary }}>Demo accounts:</strong><br />
+              👨‍👩‍👧 Parent (Tamil · Grade 4): meera@parent.com / pass123<br />
+              👨‍👩‍👧 Parent (English · Grade 6): suresh@parent.com / pass123<br />
+              👨‍👩‍👧 Parent (Tamil · Grade 10): anand@parent.com / pass123<br />
+              🆕 New User (Tamil · Grade 3): lakshmi@parent.com / pass123<br />
+              👩‍🏫 Educator: priya@edu.com / pass123
             </div>
           )}
         </Card>
@@ -1471,37 +1618,36 @@ const AuthPage = ({ onLogin }) => {
   );
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// EXISTING EDUCATOR DASHBOARD — Minimally extended with new Features
-// Changes: Added milestones view per child, added progress graph per child
-// ─────────────────────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 10 — EDUCATOR DASHBOARD
+// ════════════════════════════════════════════════════════════════════════════════
 
 const EducatorDashboard = ({ user, onLogout }) => {
-  const [activeTab, setActiveTab] = useState("overview");
+  const [activeTab, setActiveTab]   = useState("overview");
   const [selectedChild, setSelectedChild] = useState(null);
-  const [aiLoading, setAiLoading] = useState(false);
-  const [aiPlan, setAiPlan] = useState(null);
-  const [editPlan, setEditPlan] = useState(null);
+  const [aiLoading, setAiLoading]   = useState(false);
+  const [aiPlan, setAiPlan]         = useState(null);
+  const [editPlan, setEditPlan]     = useState(null);
   const [assessForm, setAssessForm] = useState({ communication: 50, motor: 50, cognitive: 50, social: 50, emotional: 50 });
   const [notification, setNotification] = useState("");
-  const [saving, setSaving] = useState(false);
+  const [saving, setSaving]         = useState(false);
   const [feedbackList, setFeedbackList] = useState([]);
 
   const educator = assessmentService.getEducatorById(user.userId);
-  const children = educator?.assignedChildren?.map(id => assessmentService.getParentById(id)).filter(Boolean) || [];
-  const unreadFeedback = assessmentService.getFeedbackByEducator(user.userId).filter(f => !f.isRead).length;
+  const children = educator?.assignedChildren?.map(id => assessmentService.getParentById(id)).filter(Boolean) ?? [];
+  const unread   = assessmentService.getFeedbackByEducator(user.userId).filter(f => !f.isRead).length;
 
   useEffect(() => { setFeedbackList(assessmentService.getFeedbackByEducator(user.userId)); }, [user.userId]);
-  const notify = (msg) => { setNotification(msg); setTimeout(() => setNotification(""), 3500); };
+  const notify = msg => { setNotification(msg); setTimeout(() => setNotification(""), 3500); };
 
   const handleGenIEP = async () => {
     if (!selectedChild) return;
     const asss = assessmentService.getAssessmentsByChild(selectedChild.id);
     const latest = asss[asss.length - 1];
-    if (!latest) { notify("⚠️ Please add an assessment first."); return; }
+    if (!latest) { notify("⚠️ Add an assessment first."); return; }
     setAiLoading(true);
     const plan = await aiService.generateNextWeekPlan(selectedChild, { weekNumber: asss.length, learningOutcome: "Build on existing skills" }, { score: latest.score });
-    setAiPlan(plan); setEditPlan({ ...plan, weeklyPlan: [...plan.weeklyPlan.map(d => ({ ...d }))] });
+    setAiPlan(plan); setEditPlan({ ...plan, weeklyPlan: plan.weeklyPlan.map(d => ({ ...d })) });
     setAiLoading(false); setActiveTab("iep");
   };
 
@@ -1511,12 +1657,11 @@ const EducatorDashboard = ({ user, onLogout }) => {
     await new Promise(r => setTimeout(r, 700));
     const asss = assessmentService.getAssessmentsByChild(selectedChild.id);
     const latest = asss[asss.length - 1];
-    const newPlan = { id: "iep" + Date.now(), childID: selectedChild.id, educatorID: user.userId, weeklyPlan: editPlan.weeklyPlan, learningOutcome: editPlan.learningOutcome, status: "ONGOING", weekNumber: asss.length, aiGenerated: true, editedByEducator: JSON.stringify(editPlan) !== JSON.stringify(aiPlan), previousScore: latest?.score || 0, targetScore: editPlan.targetScore || (latest?.score + 12), createdAt: new Date().toISOString() };
+    const newPlan = { id: "iep" + Date.now(), childID: selectedChild.id, educatorID: user.userId, weeklyPlan: editPlan.weeklyPlan, learningOutcome: editPlan.learningOutcome, status: "ONGOING", weekNumber: asss.length, aiGenerated: true, editedByEducator: true, previousScore: latest?.score ?? 0, targetScore: editPlan.targetScore ?? ((latest?.score ?? 50) + 12), createdAt: new Date().toISOString() };
     mockDB.iepPlans.push(newPlan);
-    // Feature 1 + 5: Generate milestones when educator saves IEP
     const milestones = await aiService.generateMilestones(newPlan, selectedChild);
     milestoneService.saveMilestones(selectedChild.id, newPlan.weekNumber, milestones);
-    notify("✅ IEP Plan + Milestones saved and sent to parent!");
+    notify("✅ IEP Plan + Milestones saved!");
     setAiPlan(null); setEditPlan(null); setSaving(false);
   };
 
@@ -1525,121 +1670,153 @@ const EducatorDashboard = ({ user, onLogout }) => {
     const vals = Object.values(assessForm).map(Number);
     const score = Math.round(vals.reduce((a, b) => a + b, 0) / vals.length);
     const prev = assessmentService.getAssessmentsByChild(selectedChild.id);
-    const newAss = { id: "ass" + Date.now(), childID: selectedChild.id, educatorID: user.userId, testDetails: { ...assessForm }, score, date: new Date().toISOString().slice(0, 10), weekNumber: prev.length + 1 };
-    mockDB.assessments.push(newAss);
+    mockDB.assessments.push({ id: "ass" + Date.now(), childID: selectedChild.id, educatorID: user.userId, testDetails: { ...assessForm }, score, date: new Date().toISOString().slice(0, 10), weekNumber: prev.length + 1 });
     notify(`✅ Assessment saved. Score: ${score}/100`);
-    setAssessForm({ communication: 50, motor: 50, cognitive: 50, social: 50, emotional: 50 });
   };
 
   const tabs = [
-    { id: "overview", label: "🏠 Overview" },
-    { id: "assess", label: "📊 Assess" },
-    { id: "iep", label: "📋 IEP Plans" },
-    { id: "milestones", label: "🏁 Milestones" }, // NEW
-    { id: "progress", label: "📈 Progress" },     // NEW
-    { id: "feedback", label: `💬 Feedback${unreadFeedback > 0 ? ` (${unreadFeedback})` : ""}` },
+    { id: "overview",   label: "🏠 Overview" },
+    { id: "curriculum", label: "📚 Curriculum" },
+    { id: "assess",     label: "📊 Assess" },
+    { id: "iep",        label: "🎓 IEP Plans" },
+    { id: "milestones", label: "🏁 Milestones" },
+    { id: "progress",   label: "📈 Progress" },
+    { id: "feedback",   label: `💬 Feedback${unread > 0 ? ` (${unread})` : ""}` },
   ];
 
   return (
     <div style={{ minHeight: "100vh", background: "#f4f8fd" }}>
-      <style>{globalStyle}</style>
-      <div style={{ background: colors.gradient, padding: "16px 24px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+      <style>{G}</style>
+      {/* Header */}
+      <div style={{ background: C.gradient, padding: "16px 24px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
           <span style={{ fontSize: 28 }}>🌱</span>
-          <div>
-            <div style={{ fontFamily: "DM Serif Display", fontSize: 20, color: "#fff" }}>EduPath</div>
-            <div style={{ fontSize: 12, color: "rgba(255,255,255,0.7)" }}>Educator Portal</div>
-          </div>
+          <div><div style={{ fontFamily: "DM Serif Display", fontSize: 20, color: "#fff" }}>EduPath</div><div style={{ fontSize: 12, color: "rgba(255,255,255,0.7)" }}>Educator Portal · v4</div></div>
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-          <div style={{ textAlign: "right" }}>
-            <div style={{ color: "#fff", fontWeight: 700, fontSize: 14 }}>{educator?.name}</div>
-            <div style={{ color: "rgba(255,255,255,0.7)", fontSize: 12 }}>{educator?.educatorType} Specialist</div>
-          </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ textAlign: "right" }}><div style={{ color: "#fff", fontWeight: 700, fontSize: 14 }}>{educator?.name}</div><div style={{ color: "rgba(255,255,255,0.7)", fontSize: 12 }}>{educator?.educatorType} Specialist</div></div>
           <Button onClick={onLogout} variant="outline" size="sm" style={{ color: "#fff", borderColor: "rgba(255,255,255,0.4)" }}>Logout</Button>
         </div>
       </div>
-      {notification && <div style={{ background: colors.success, color: "#fff", padding: "12px 24px", textAlign: "center", fontWeight: 700 }}>{notification}</div>}
+      {notification && <div style={{ background: C.success, color: "#fff", padding: "12px 24px", textAlign: "center", fontWeight: 700 }}>{notification}</div>}
 
       <div style={{ display: "flex", minHeight: "calc(100vh - 72px)" }}>
-        <div style={{ width: 220, background: "#fff", borderRight: `1px solid ${colors.border}`, padding: "24px 0", flexShrink: 0 }}>
+        {/* Sidebar */}
+        <div style={{ width: 230, background: "#fff", borderRight: `1px solid ${C.border}`, padding: "24px 0", flexShrink: 0 }}>
           {tabs.map(t => (
-            <button key={t.id} onClick={() => setActiveTab(t.id)} style={{ width: "100%", textAlign: "left", padding: "12px 24px", border: "none", background: activeTab === t.id ? colors.soft : "transparent", color: activeTab === t.id ? colors.primary : colors.muted, fontFamily: "Nunito", fontWeight: activeTab === t.id ? 800 : 600, fontSize: 13, cursor: "pointer", borderLeft: activeTab === t.id ? `4px solid ${colors.secondary}` : "4px solid transparent", transition: "all 0.2s" }}>
+            <button key={t.id} onClick={() => setActiveTab(t.id)} style={{ width: "100%", textAlign: "left", padding: "11px 20px", border: "none", background: activeTab === t.id ? C.soft : "transparent", color: activeTab === t.id ? C.primary : C.muted, fontFamily: "Nunito", fontWeight: activeTab === t.id ? 800 : 600, fontSize: 13, cursor: "pointer", borderLeft: activeTab === t.id ? `4px solid ${C.secondary}` : "4px solid transparent", transition: "all 0.2s" }}>
               {t.label}
             </button>
           ))}
-          <div style={{ padding: "12px 16px", marginTop: 8 }}>
-            <div style={{ fontSize: 12, color: colors.muted, fontWeight: 700, marginBottom: 8 }}>Students ({children.length})</div>
-            {children.map(c => (
-              <button key={c.id} onClick={() => setSelectedChild(c)} style={{ display: "block", width: "100%", padding: "8px 10px", borderRadius: 10, marginBottom: 4, border: `1.5px solid ${selectedChild?.id === c.id ? colors.accent : colors.border}`, background: selectedChild?.id === c.id ? "#f0fdfa" : "#fff", cursor: "pointer", textAlign: "left", fontFamily: "Nunito" }}>
-                <div style={{ fontWeight: 700, fontSize: 13, color: colors.primary }}>{c.childName}</div>
-                <div style={{ fontSize: 11, color: colors.muted }}>{c.disabilityType} · Age {c.age}</div>
-              </button>
-            ))}
-          </div>
+          {/* Student list */}
+          {children.length > 0 && (
+            <div style={{ padding: "16px 12px" }}>
+              <div style={{ fontSize: 11, color: C.muted, fontWeight: 700, marginBottom: 8, paddingLeft: 8 }}>STUDENTS ({children.length})</div>
+              {children.map(c => {
+                const grade = curriculumEngine.getGradeFromAge(c.age);
+                const gInfo = curriculumEngine.getSubjectsForGrade(grade);
+                return (
+                  <button key={c.id} onClick={() => setSelectedChild(c)}
+                    style={{ width: "100%", textAlign: "left", padding: "9px 10px", border: "none", borderRadius: 10, cursor: "pointer", marginBottom: 4, background: selectedChild?.id === c.id ? "#dbeafe" : "transparent", fontFamily: "Nunito", transition: "background 0.2s" }}>
+                    <div style={{ fontWeight: 800, fontSize: 13, color: C.primary }}>{c.childName}</div>
+                    <div style={{ fontSize: 11, color: C.muted }}>{c.disabilityType} · {gInfo.label}</div>
+                  </button>
+                );
+              })}
+            </div>
+          )}
         </div>
 
+        {/* Main content */}
         <div style={{ flex: 1, padding: 28, overflow: "auto" }}>
-          {/* OVERVIEW TAB */}
+          {/* OVERVIEW */}
           {activeTab === "overview" && (
             <div className="fade-in">
-              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: colors.primary, marginBottom: 20 }}>Overview</h2>
-              {children.length === 0 && <Alert type="info">No children assigned yet. They will be matched to you based on your specialization ({educator?.educatorType}).</Alert>}
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 16, marginBottom: 24 }}>
+              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: C.primary, marginBottom: 20 }}>Overview</h2>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 14, marginBottom: 24 }}>
                 {[
-                  { label: "Assigned Children", value: children.length, icon: "👧", color: "#dbeafe" },
-                  { label: "Total Plans", value: mockDB.iepPlans.filter(p => p.educatorID === user.userId).length, icon: "📋", color: "#d1fae5" },
-                  { label: "Unread Feedback", value: unreadFeedback, icon: "💬", color: "#ffedd5" },
-                  { label: "My Specialization", value: educator?.educatorType, icon: "🎓", color: "#fdf4ff" },
+                  { label: "Total Students", value: children.length,    icon: "👶", color: "#dbeafe" },
+                  { label: "Total Plans",    value: mockDB.iepPlans.filter(p => p.educatorID === user.userId).length, icon: "📋", color: "#d1fae5" },
+                  { label: "Unread Feedback",value: unread,             icon: "💬", color: unread > 0 ? "#ffedd5" : "#f0fdf4" },
                 ].map(s => (
-                  <Card key={s.label} style={{ background: s.color, border: "none", textAlign: "center" }}>
+                  <Card key={s.label} style={{ background: s.color, border: "none", textAlign: "center", padding: "16px 12px" }}>
                     <div style={{ fontSize: 28, marginBottom: 6 }}>{s.icon}</div>
-                    <div style={{ fontSize: 20, fontWeight: 900, color: colors.primary }}>{s.value}</div>
-                    <div style={{ fontSize: 12, color: colors.muted, fontWeight: 700 }}>{s.label}</div>
+                    <div style={{ fontSize: 24, fontWeight: 900, color: C.primary }}>{s.value}</div>
+                    <div style={{ fontSize: 12, color: C.muted, fontWeight: 700 }}>{s.label}</div>
                   </Card>
                 ))}
               </div>
               {children.map(c => {
-                const latestA = assessmentService.getAssessmentsByChild(c.id).slice(-1)[0];
-                const latestPlan = assessmentService.getIEPByChild(c.id).slice(-1)[0];
-                const weekMilestones = latestPlan ? milestoneService.getMilestonesByWeek(c.id, latestPlan.weekNumber) : null;
-                const completedMs = weekMilestones?.milestones.filter(m => m.status === "COMPLETED").length || 0;
-                const totalMs = weekMilestones?.milestones.length || 0;
+                const grade = curriculumEngine.getGradeFromAge(c.age);
+                const gInfo = curriculumEngine.getSubjectsForGrade(grade);
+                const asss  = assessmentService.getAssessmentsByChild(c.id);
+                const lastScore = asss[asss.length - 1]?.score;
                 return (
-                  <Card key={c.id} style={{ marginBottom: 16 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 12 }}>
+                  <Card key={c.id} style={{ marginBottom: 14 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 10 }}>
                       <div>
-                        <div style={{ fontWeight: 900, fontSize: 16, color: colors.primary }}>{c.childName}</div>
-                        <div style={{ color: colors.muted, fontSize: 13 }}>{c.disabilityType} · Age {c.age}</div>
+                        <div style={{ fontWeight: 900, fontSize: 16, color: C.primary }}>{c.childName}</div>
+                        <div style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>{c.disabilityType} · Age {c.age} · {gInfo.label} · {c.uniqueChildID}</div>
                       </div>
-                      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                        {latestA && <Badge color="blue">Score: {latestA.score}/100</Badge>}
-                        {latestPlan && <Badge color={latestPlan.status === "Achieved" ? "green" : "teal"}>Week {latestPlan.weekNumber}: {latestPlan.status}</Badge>}
-                        {totalMs > 0 && <Badge color={completedMs === totalMs ? "green" : "orange"}>🏁 {completedMs}/{totalMs} milestones</Badge>}
+                      <div style={{ display: "flex", gap: 6 }}>
+                        {lastScore !== undefined && <Badge color={lastScore >= 70 ? "green" : lastScore >= 40 ? "orange" : "red"}>{lastScore}/100</Badge>}
+                        <Badge color="teal">{c.preferredLanguage}</Badge>
                       </div>
                     </div>
-                    {latestPlan && <p style={{ fontSize: 13, color: colors.text }}><strong>Goal:</strong> {latestPlan.learningOutcome}</p>}
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                      {gInfo.subjects.map(s => <span key={s.name} style={{ background: "#eff6ff", color: "#1d4ed8", padding: "2px 8px", borderRadius: 10, fontSize: 11, fontWeight: 700 }}>{s.icon} {s.name}</span>)}
+                    </div>
                   </Card>
                 );
               })}
             </div>
           )}
 
-          {/* ASSESS TAB — preserved from v1 */}
+          {/* CURRICULUM — Extended to Grade 12 */}
+          {activeTab === "curriculum" && (
+            <div className="fade-in">
+              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: C.primary, marginBottom: 8 }}>Grade-Based Curriculum</h2>
+              <p style={{ color: C.muted, marginBottom: 20 }}>Age-to-grade mapping (Grade 1–12) and subject allocations used to generate personalised IEPs.</p>
+              {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map(grade => {
+                const info = curriculumEngine.getSubjectsForGrade(grade);
+                const myKids = children.filter(c => curriculumEngine.getGradeFromAge(c.age) === grade);
+                return (
+                  <Card key={grade} style={{ marginBottom: 14 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                      <div>
+                        <div style={{ fontWeight: 900, color: C.primary, fontSize: 16 }}>{info.label}</div>
+                        <div style={{ fontSize: 12, color: C.muted }}>{curriculumEngine.getAgeRangeForGrade(grade)}</div>
+                      </div>
+                      {myKids.length > 0 && <Badge color="teal">{myKids.map(c => c.childName).join(", ")}</Badge>}
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))", gap: 8 }}>
+                      {info.subjects.map(s => (
+                        <div key={s.name} style={{ padding: 10, background: C.soft, borderRadius: 10 }}>
+                          <div style={{ fontWeight: 800, fontSize: 13 }}>{s.icon} {s.name}</div>
+                          <div style={{ fontSize: 11, color: C.muted, marginTop: 3 }}>{s.focus}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </Card>
+                );
+              })}
+            </div>
+          )}
+
+          {/* ASSESS */}
           {activeTab === "assess" && (
             <div className="fade-in">
-              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: colors.primary, marginBottom: 20 }}>Assess & Generate Plan</h2>
-              {!selectedChild && <Alert type="warning">Select a student from the sidebar first.</Alert>}
-              {selectedChild && (
-                <Card style={{ marginBottom: 20 }}>
-                  <div style={{ fontWeight: 900, color: colors.primary, marginBottom: 16 }}>Assessing: {selectedChild.childName}</div>
+              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: C.primary, marginBottom: 20 }}>Assess & Generate Plan</h2>
+              {!selectedChild ? <Alert type="warning">Select a student from the sidebar.</Alert> : (
+                <Card>
+                  <div style={{ fontWeight: 900, color: C.primary, marginBottom: 16 }}>Assessing: {selectedChild.childName} · {curriculumEngine.getSubjectsForGrade(curriculumEngine.getGradeFromAge(selectedChild.age)).label}</div>
                   {Object.keys(assessForm).map(field => (
                     <div key={field} style={{ marginBottom: 14 }}>
                       <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
-                        <label style={{ fontWeight: 700, fontSize: 13, color: colors.primary, textTransform: "capitalize" }}>{field}</label>
-                        <span style={{ fontWeight: 800, color: colors.accent }}>{assessForm[field]}</span>
+                        <label style={{ fontWeight: 700, fontSize: 13, color: C.primary, textTransform: "capitalize" }}>{field}</label>
+                        <span style={{ fontWeight: 800, color: C.accent }}>{assessForm[field]}</span>
                       </div>
-                      <input type="range" min={0} max={100} value={assessForm[field]} onChange={e => setAssessForm(p => ({ ...p, [field]: e.target.value }))} style={{ width: "100%" }} />
+                      <input type="range" min={0} max={100} value={assessForm[field]} onChange={e => setAssessForm(p => ({ ...p, [field]: e.target.value }))} style={{ width: "100%", accentColor: C.accent }} />
                     </div>
                   ))}
                   <div style={{ display: "flex", gap: 12 }}>
@@ -1651,55 +1828,54 @@ const EducatorDashboard = ({ user, onLogout }) => {
             </div>
           )}
 
-          {/* IEP TAB — preserved from v1 */}
+          {/* IEP PLANS */}
           {activeTab === "iep" && (
             <div className="fade-in">
-              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: colors.primary, marginBottom: 20 }}>IEP Plans</h2>
+              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: C.primary, marginBottom: 20 }}>IEP Plans</h2>
               {editPlan && aiPlan ? (
                 <Card>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
-                    <h3 style={{ fontWeight: 800, color: colors.primary }}>✏️ Review & Edit AI-Generated Plan</h3>
+                    <h3 style={{ fontWeight: 800, color: C.primary }}>✏️ Review & Edit AI Plan</h3>
                     <div style={{ display: "flex", gap: 8 }}>
                       <Button onClick={handleSaveIEP} disabled={saving} variant="secondary">{saving ? "Saving…" : "Save & Send ✓"}</Button>
                       <Button onClick={() => { setAiPlan(null); setEditPlan(null); }} variant="outline">Cancel</Button>
                     </div>
                   </div>
                   <div style={{ marginBottom: 16 }}>
-                    <label style={{ fontWeight: 700, fontSize: 13, color: colors.primary, display: "block", marginBottom: 6 }}>Learning Outcome</label>
-                    <input value={editPlan.learningOutcome} onChange={e => setEditPlan(p => ({ ...p, learningOutcome: e.target.value }))} style={{ width: "100%", padding: "10px 12px", border: `1.5px solid ${colors.border}`, borderRadius: 10, fontFamily: "Nunito", fontSize: 14, outline: "none" }} />
+                    <label style={{ fontWeight: 700, fontSize: 13, color: C.primary, display: "block", marginBottom: 6 }}>Learning Outcome</label>
+                    <input value={editPlan.learningOutcome} onChange={e => setEditPlan(p => ({ ...p, learningOutcome: e.target.value }))} style={{ width: "100%", padding: "10px 12px", border: `1.5px solid ${C.border}`, borderRadius: 10, fontFamily: "Nunito", fontSize: 14, outline: "none" }} />
                   </div>
                   {editPlan.weeklyPlan.map((day, i) => (
-                    <div key={i} style={{ padding: 14, background: colors.soft, borderRadius: 12, marginBottom: 10 }}>
-                      <div style={{ fontWeight: 800, color: colors.secondary, marginBottom: 8 }}>{day.day}</div>
+                    <div key={i} style={{ padding: 14, background: C.soft, borderRadius: 12, marginBottom: 10 }}>
+                      <div style={{ fontWeight: 800, color: C.secondary, marginBottom: 8 }}>{day.day}</div>
                       {["activity", "goal", "materials"].map(field => (
-                        <input key={field} value={day[field]} onChange={e => { const wp = [...editPlan.weeklyPlan]; wp[i] = { ...wp[i], [field]: e.target.value }; setEditPlan(p => ({ ...p, weeklyPlan: wp })); }} placeholder={field} style={{ display: "block", width: "100%", padding: "7px 10px", marginBottom: 6, border: `1px solid ${colors.border}`, borderRadius: 8, fontFamily: "Nunito", fontSize: 13, outline: "none" }} />
+                        <input key={field} value={day[field]} onChange={e => { const wp = [...editPlan.weeklyPlan]; wp[i] = { ...wp[i], [field]: e.target.value }; setEditPlan(p => ({ ...p, weeklyPlan: wp })); }} placeholder={field} style={{ display: "block", width: "100%", padding: "7px 10px", marginBottom: 6, border: `1px solid ${C.border}`, borderRadius: 8, fontFamily: "Nunito", fontSize: 13, outline: "none" }} />
                       ))}
                     </div>
                   ))}
                 </Card>
               ) : (
                 <div>
-                  {mockDB.iepPlans.filter(p => p.educatorID === user.userId).length === 0 && <Alert type="info">No IEP plans yet. Go to Assess tab to generate one.</Alert>}
+                  {mockDB.iepPlans.filter(p => p.educatorID === user.userId).length === 0 && <Alert type="info">No IEP plans yet. Go to Assess tab.</Alert>}
                   {mockDB.iepPlans.filter(p => p.educatorID === user.userId).slice().reverse().map(plan => {
                     const child = assessmentService.getParentById(plan.childID);
                     return (
-                      <Card key={plan.id} style={{ marginBottom: 16 }}>
-                        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 12 }}>
+                      <Card key={plan.id} style={{ marginBottom: 14 }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
                           <div>
-                            <div style={{ fontWeight: 900, fontSize: 17, color: colors.primary }}>Week {plan.weekNumber} — {child?.childName}</div>
-                            <div style={{ color: colors.muted, fontSize: 13, marginTop: 2 }}>{plan.learningOutcome}</div>
+                            <div style={{ fontWeight: 900, fontSize: 16, color: C.primary }}>Week {plan.weekNumber} — {child?.childName}</div>
+                            <div style={{ color: C.muted, fontSize: 13, marginTop: 2 }}>{plan.learningOutcome}</div>
                           </div>
-                          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
-                            <Badge color={plan.status === "Achieved" ? "green" : plan.status === "ONGOING" ? "teal" : "orange"}>{plan.status}</Badge>
+                          <div style={{ display: "flex", gap: 6 }}>
+                            <Badge color={plan.status === "Achieved" ? "green" : "teal"}>{plan.status}</Badge>
                             {plan.aiModified && <Badge color="purple">AI Modified</Badge>}
                           </div>
                         </div>
-                        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: 8 }}>
+                        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))", gap: 8 }}>
                           {plan.weeklyPlan.map((day, i) => (
-                            <div key={i} style={{ padding: 12, background: colors.soft, borderRadius: 10 }}>
-                              <div style={{ fontWeight: 800, fontSize: 12, color: colors.secondary }}>{day.day}</div>
-                              <div style={{ fontSize: 11, color: colors.text, marginTop: 4 }}>{day.activity}</div>
-                              <div style={{ fontSize: 11, color: colors.muted, marginTop: 3 }}>🎯 {day.goal}</div>
+                            <div key={i} style={{ padding: 10, background: C.soft, borderRadius: 10 }}>
+                              <div style={{ fontWeight: 800, fontSize: 12, color: C.secondary }}>{day.day}</div>
+                              <div style={{ fontSize: 11, color: C.text, marginTop: 3 }}>{day.activity}</div>
                             </div>
                           ))}
                         </div>
@@ -1711,72 +1887,49 @@ const EducatorDashboard = ({ user, onLogout }) => {
             </div>
           )}
 
-          {/* NEW: MILESTONES TAB — Feature 1 */}
+          {/* MILESTONES */}
           {activeTab === "milestones" && (
             <div className="fade-in">
-              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: colors.primary, marginBottom: 20 }}>Milestones Tracker</h2>
-              {!selectedChild ? (
-                <Alert type="info">Select a student from the sidebar to view their milestones.</Alert>
-              ) : (
-                <div>
-                  <div style={{ fontWeight: 800, color: colors.primary, marginBottom: 16 }}>{selectedChild.childName}'s Milestones</div>
-                  {milestoneService.getMilestonesByChild(selectedChild.id).length === 0 ? (
-                    <Alert type="info">No milestones yet. Generate an IEP plan to auto-create milestones.</Alert>
-                  ) : (
-                    milestoneService.getMilestonesByChild(selectedChild.id).map(record => (
-                      <Card key={record.id} style={{ marginBottom: 16 }}>
-                        <MilestoneTracker childId={selectedChild.id} week={record.week} refreshKey={0} />
-                      </Card>
-                    ))
-                  )}
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* NEW: PROGRESS TAB — Feature 2 */}
-          {activeTab === "progress" && (
-            <div className="fade-in">
-              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: colors.primary, marginBottom: 20 }}>Progress Graphs</h2>
-              {!selectedChild ? (
-                children.length > 0 ? (
-                  children.map(c => (
-                    <Card key={c.id} style={{ marginBottom: 24 }}>
-                      <div style={{ fontWeight: 800, color: colors.primary, marginBottom: 16 }}>{c.childName}</div>
-                      <ProgressGraph childId={c.id} />
+              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: C.primary, marginBottom: 20 }}>Milestones</h2>
+              {!selectedChild ? <Alert type="info">Select a student to view milestones.</Alert> : (
+                milestoneService.getMilestonesByChild(selectedChild.id).length === 0
+                  ? <Alert type="info">No milestones yet. Generate an IEP plan first.</Alert>
+                  : milestoneService.getMilestonesByChild(selectedChild.id).map(rec => (
+                    <Card key={rec.id} style={{ marginBottom: 14 }}>
+                      <MilestoneTracker childId={selectedChild.id} week={rec.week} refreshKey={0} />
                     </Card>
                   ))
-                ) : <Alert type="info">No students assigned yet.</Alert>
-              ) : (
-                <Card>
-                  <div style={{ fontWeight: 800, color: colors.primary, marginBottom: 16 }}>{selectedChild.childName}</div>
-                  <ProgressGraph childId={selectedChild.id} />
-                </Card>
               )}
             </div>
           )}
 
-          {/* FEEDBACK TAB — preserved */}
+          {/* PROGRESS */}
+          {activeTab === "progress" && (
+            <div className="fade-in">
+              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: C.primary, marginBottom: 20 }}>Progress</h2>
+              {!selectedChild
+                ? children.length > 0
+                  ? children.map(c => <Card key={c.id} style={{ marginBottom: 20 }}><div style={{ fontWeight: 800, color: C.primary, marginBottom: 12 }}>{c.childName}</div><ProgressGraph childId={c.id} /></Card>)
+                  : <Alert type="info">No students assigned.</Alert>
+                : <Card><div style={{ fontWeight: 800, color: C.primary, marginBottom: 12 }}>{selectedChild.childName}</div><ProgressGraph childId={selectedChild.id} /></Card>
+              }
+            </div>
+          )}
+
+          {/* FEEDBACK */}
           {activeTab === "feedback" && (
             <div className="fade-in">
-              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: colors.primary, marginBottom: 20 }}>Parent Feedback</h2>
+              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: C.primary, marginBottom: 20 }}>Parent Feedback</h2>
               {feedbackList.length === 0 && <Alert type="info">No feedback received yet.</Alert>}
               {feedbackList.map(fb => {
-                const parent = assessmentService.getParentById(fb.parentID);
+                const p = assessmentService.getParentById(fb.parentID);
                 return (
-                  <Card key={fb.id} style={{ marginBottom: 14 }}>
+                  <Card key={fb.id} style={{ marginBottom: 12 }}>
                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
-                      <div>
-                        <span style={{ fontWeight: 800, color: colors.primary }}>{parent?.parentName}</span>
-                        <span style={{ color: colors.muted, fontSize: 12, marginLeft: 8 }}>re: {parent?.childName}</span>
-                      </div>
-                      <div style={{ display: "flex", gap: 8 }}>
-                        <span style={{ color: "#f5a623" }}>{"★".repeat(fb.rating)}</span>
-                        <span style={{ fontSize: 12, color: colors.muted }}>{fb.date}</span>
-                        {!fb.isRead && <Badge color="orange">New</Badge>}
-                      </div>
+                      <div><span style={{ fontWeight: 800, color: C.primary }}>{p?.parentName}</span><span style={{ color: C.muted, fontSize: 12, marginLeft: 8 }}>re: {p?.childName}</span></div>
+                      <div style={{ display: "flex", gap: 8 }}><span style={{ color: "#f5a623" }}>{"★".repeat(fb.rating)}</span><span style={{ fontSize: 12, color: C.muted }}>{fb.date}</span>{!fb.isRead && <Badge color="orange">New</Badge>}</div>
                     </div>
-                    <p style={{ fontSize: 14, color: colors.text, lineHeight: 1.6 }}>{fb.message}</p>
+                    <p style={{ fontSize: 14, color: C.text }}>{fb.message}</p>
                   </Card>
                 );
               })}
@@ -1788,32 +1941,34 @@ const EducatorDashboard = ({ user, onLogout }) => {
   );
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PARENT DASHBOARD — Extended with new Feature tabs
-// New tabs: Milestones, Progress, Summaries
-// All existing tabs preserved unchanged
-// ─────────────────────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 11 — PARENT DASHBOARD
+// ════════════════════════════════════════════════════════════════════════════════
 
 const ParentDashboard = ({ user, onLogout }) => {
-  const [activeTab, setActiveTab] = useState("overview");
+  const [activeTab, setActiveTab]     = useState("overview");
   const [notification, setNotification] = useState("");
-  const [fbMsg, setFbMsg] = useState(""); const [fbRating, setFbRating] = useState(5); const [fbSubmitting, setFbSubmitting] = useState(false);
+  const [fbMsg, setFbMsg]             = useState("");
+  const [fbRating, setFbRating]       = useState(5);
+  const [fbSubmitting, setFbSubmitting] = useState(false);
   const [showWeeklyEval, setShowWeeklyEval] = useState(false);
   const [selectedEvalPlan, setSelectedEvalPlan] = useState(null);
-  const [refreshKey, setRefreshKey] = useState(0);
+  const [refreshKey, setRefreshKey]   = useState(0);
 
-  const parent = assessmentService.getParentById(user.userId);
-  const educator = assessmentService.getEducatorById(parent?.assignedEducatorID);
+  const parent     = assessmentService.getParentById(user.userId);
+  const educator   = assessmentService.getEducatorById(parent?.assignedEducatorID);
   const assessments = assessmentService.getAssessmentsByChild(user.userId);
-  const iepPlans = assessmentService.getIEPByChild(user.userId);
+  const iepPlans   = assessmentService.getIEPByChild(user.userId);
   const myFeedback = assessmentService.getFeedbackByParent(user.userId);
   const latestPlan = iepPlans[iepPlans.length - 1];
   const latestScore = assessments[assessments.length - 1]?.score;
-  const trend = assessments.length >= 2 ? assessments[assessments.length - 1].score - assessments[assessments.length - 2].score : 0;
-  const initAssmt = assessmentService.getInitialAssessment(user.userId);
+  const trend       = assessments.length >= 2 ? assessments[assessments.length - 1].score - assessments[assessments.length - 2].score : 0;
+  const initAssmt  = assessmentService.getInitialAssessment(user.userId);
   const weeklyEvals = assessmentService.getWeeklyEvaluations(user.userId);
+  const grade       = curriculumEngine.getGradeFromAge(parent?.age);
+  const gradeInfo   = curriculumEngine.getSubjectsForGrade(grade);
 
-  const notify = (msg) => { setNotification(msg); setTimeout(() => setNotification(""), 3500); };
+  const notify = msg => { setNotification(msg); setTimeout(() => setNotification(""), 3500); };
 
   const handleFeedback = async () => {
     if (!fbMsg.trim() || !educator) return;
@@ -1823,11 +1978,11 @@ const ParentDashboard = ({ user, onLogout }) => {
     notify("✅ Feedback sent!"); setFbMsg(""); setFbRating(5); setFbSubmitting(false);
   };
 
-  const handleStartEval = (plan) => { setSelectedEvalPlan(plan); setShowWeeklyEval(true); };
+  const handleStartEval = plan => { setSelectedEvalPlan(plan); setShowWeeklyEval(true); };
   const handleEvalComplete = () => {
     setShowWeeklyEval(false); setSelectedEvalPlan(null);
     setRefreshKey(k => k + 1);
-    notify("✅ Weekly evaluation complete! Milestones updated, Tamil summary generated.");
+    notify("✅ Evaluation complete! Summary available in English & Tamil.");
     setActiveTab("overview");
   };
 
@@ -1836,218 +1991,162 @@ const ParentDashboard = ({ user, onLogout }) => {
   }
 
   const cycleStatus = () => {
-    if (!initAssmt) return { step: 0, label: "Awaiting Initial Assessment", color: colors.muted };
-    if (iepPlans.length === 0) return { step: 1, label: "Week 1 Plan Being Generated", color: colors.warning };
-    if (weeklyEvals.length === 0) return { step: 2, label: "Ready for Week 1 Evaluation", color: colors.accent };
-    const lastEval = weeklyEvals[weeklyEvals.length - 1];
-    if (lastEval.aiDecision === "ADVANCE") return { step: 3, label: `Week ${lastEval.weekNumber + 1} Plan Ready`, color: colors.success };
-    return { step: 3, label: "Plan Being Adapted by AI", color: colors.warning };
+    if (!initAssmt) return { step: 0, label: "Awaiting Initial Assessment", color: C.muted };
+    if (iepPlans.length === 0) return { step: 1, label: "Week 1 Plan Pending", color: C.warning };
+    if (weeklyEvals.length === 0) return { step: 2, label: "Ready for Week 1 Evaluation", color: C.accent };
+    const last = weeklyEvals[weeklyEvals.length - 1];
+    return last.aiDecision === "ADVANCE"
+      ? { step: 3, label: `Week ${last.weekNumber + 1} Plan Ready`, color: C.success }
+      : { step: 3, label: "Plan Being Adapted",                     color: C.warning };
   };
 
   const tabs = [
-    { id: "overview", label: "🏠 Overview" },
-    { id: "assessment", label: "🔬 Assessment" },
-    { id: "plans", label: "📋 Plans" },
-    { id: "milestones", label: "🏁 Milestones" },   // NEW Feature 1
-    { id: "progress", label: "📈 Progress" },        // NEW Feature 2
-    { id: "summaries", label: "📝 Summaries" },      // NEW Feature 3
+    { id: "overview",    label: "🏠 Overview" },
+    { id: "iep",         label: "🎓 My IEP" },
+    { id: "plans",       label: "📋 Weekly Plans" },
+    { id: "milestones",  label: "🏁 Milestones" },
+    { id: "progress",    label: "📈 Progress" },
+    { id: "summaries",   label: "📝 Summaries" },
     { id: "evaluations", label: "📊 Evaluations" },
-    { id: "feedback", label: "💬 Feedback" },
+    { id: "feedback",    label: "💬 Feedback" },
   ];
 
   const cycle = cycleStatus();
 
   return (
     <div style={{ minHeight: "100vh", background: "#f4f8fd" }} key={refreshKey}>
-      <style>{globalStyle}</style>
-      <div style={{ background: colors.gradient, padding: "16px 24px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+      <style>{G}</style>
+      {/* Header */}
+      <div style={{ background: C.gradient, padding: "16px 24px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
           <span style={{ fontSize: 28 }}>🌱</span>
-          <div>
-            <div style={{ fontFamily: "DM Serif Display", fontSize: 20, color: "#fff" }}>EduPath</div>
-            <div style={{ fontSize: 12, color: "rgba(255,255,255,0.7)" }}>Parent Portal</div>
-          </div>
+          <div><div style={{ fontFamily: "DM Serif Display", fontSize: 20, color: "#fff" }}>EduPath</div><div style={{ fontSize: 12, color: "rgba(255,255,255,0.7)" }}>Parent Portal · v4</div></div>
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <div style={{ textAlign: "right" }}>
             <div style={{ color: "#fff", fontWeight: 700, fontSize: 14 }}>{parent?.parentName}</div>
-            <div style={{ color: "rgba(255,255,255,0.7)", fontSize: 12 }}>{parent?.childName} · {parent?.uniqueChildID}</div>
+            <div style={{ color: "rgba(255,255,255,0.7)", fontSize: 12 }}>{parent?.childName} · {gradeInfo.label} · {parent?.uniqueChildID}</div>
           </div>
           <Button onClick={onLogout} variant="outline" size="sm" style={{ color: "#fff", borderColor: "rgba(255,255,255,0.4)" }}>Logout</Button>
         </div>
       </div>
-      {notification && <div style={{ background: colors.success, color: "#fff", padding: "12px 24px", textAlign: "center", fontWeight: 700 }}>{notification}</div>}
-
-      {/* Feature 4: Show educator pending message at top if no educator yet */}
-      {!educator && (
-        <div style={{ background: "#fffbeb", borderLeft: `4px solid ${colors.warning}`, padding: "12px 24px", display: "flex", alignItems: "center", gap: 10 }}>
-          <span>⏳</span>
-          <span style={{ fontSize: 13, fontWeight: 700, color: "#92400e" }}>Please wait while we find a suitable educator for your child. We'll notify you once matched.</span>
-        </div>
-      )}
+      {notification && <div style={{ background: C.success, color: "#fff", padding: "12px 24px", textAlign: "center", fontWeight: 700 }}>{notification}</div>}
+      {!educator && <div style={{ background: "#fffbeb", borderLeft: `4px solid ${C.warning}`, padding: "12px 24px", fontSize: 13, fontWeight: 700, color: "#92400e" }}>⏳ Finding a suitable educator for your child. Your IEP is ready to view in the meantime.</div>}
 
       <div style={{ display: "flex", minHeight: "calc(100vh - 72px)" }}>
-        <div style={{ width: 220, background: "#fff", borderRight: `1px solid ${colors.border}`, padding: "24px 0", flexShrink: 0 }}>
+        {/* Sidebar */}
+        <div style={{ width: 230, background: "#fff", borderRight: `1px solid ${C.border}`, padding: "24px 0", flexShrink: 0 }}>
           {tabs.map(t => (
-            <button key={t.id} onClick={() => setActiveTab(t.id)} style={{ width: "100%", textAlign: "left", padding: "12px 24px", border: "none", background: activeTab === t.id ? colors.soft : "transparent", color: activeTab === t.id ? colors.primary : colors.muted, fontFamily: "Nunito", fontWeight: activeTab === t.id ? 800 : 600, fontSize: 13, cursor: "pointer", borderLeft: activeTab === t.id ? `4px solid ${colors.secondary}` : "4px solid transparent", transition: "all 0.2s" }}>
+            <button key={t.id} onClick={() => setActiveTab(t.id)} style={{ width: "100%", textAlign: "left", padding: "11px 20px", border: "none", background: activeTab === t.id ? C.soft : "transparent", color: activeTab === t.id ? C.primary : C.muted, fontFamily: "Nunito", fontWeight: activeTab === t.id ? 800 : 600, fontSize: 13, cursor: "pointer", borderLeft: activeTab === t.id ? `4px solid ${C.secondary}` : "4px solid transparent", transition: "all 0.2s" }}>
               {t.label}
             </button>
           ))}
-          <div style={{ margin: "24px 16px 0", padding: 14, background: educator ? "#d1fae5" : "#fff7ed", borderRadius: 12, border: `1px solid ${educator ? "#6ee7b7" : "#fed7aa"}` }}>
-            <div style={{ fontSize: 11, color: colors.muted, fontWeight: 700, marginBottom: 4 }}>Educator</div>
-            {educator ? (
-              <>
-                <div style={{ fontWeight: 800, color: colors.primary, fontSize: 13 }}>{educator.name}</div>
-                <div style={{ fontSize: 11, color: colors.muted }}>{educator.educatorType}</div>
-              </>
-            ) : (
-              <div style={{ color: "#92400e", fontSize: 12, fontWeight: 700 }}>⏳ Finding match…</div>
-            )}
+          {/* Educator card */}
+          <div style={{ margin: "16px", padding: 12, background: educator ? "#d1fae5" : "#fff7ed", borderRadius: 12, border: `1px solid ${educator ? "#6ee7b7" : "#fed7aa"}` }}>
+            <div style={{ fontSize: 11, color: C.muted, fontWeight: 700, marginBottom: 4 }}>Educator</div>
+            {educator ? (<><div style={{ fontWeight: 800, color: C.primary, fontSize: 13 }}>{educator.name}</div><div style={{ fontSize: 11, color: C.muted }}>{educator.educatorType}</div></>) : <div style={{ color: "#92400e", fontSize: 12, fontWeight: 700 }}>⏳ Finding match…</div>}
+          </div>
+          {/* Grade + language info */}
+          <div style={{ margin: "0 16px", padding: 12, background: "#eff6ff", borderRadius: 12 }}>
+            <div style={{ fontSize: 11, color: "#1d4ed8", fontWeight: 700 }}>📚 {gradeInfo.label} ({curriculumEngine.getAgeRangeForGrade(grade)})</div>
+            <div style={{ fontSize: 11, color: "#1d4ed8", marginTop: 3 }}>🌐 {parent?.preferredLanguage}</div>
           </div>
         </div>
 
+        {/* Main content */}
         <div style={{ flex: 1, padding: 28, overflow: "auto" }}>
 
-          {/* OVERVIEW TAB */}
+          {/* OVERVIEW */}
           {activeTab === "overview" && (
             <div className="fade-in">
-              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: colors.primary, marginBottom: 8 }}>Welcome, {parent?.parentName?.split(" ")[0]}! 💙</h2>
-              <p style={{ color: colors.muted, marginBottom: 20 }}>{parent?.childName}'s learning journey at a glance.</p>
+              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: C.primary, marginBottom: 8 }}>Welcome, {parent?.parentName?.split(" ")[0]}! 💙</h2>
+              <p style={{ color: C.muted, marginBottom: 20 }}>{parent?.childName}'s learning journey at a glance.</p>
 
-              {/* Cycle Status */}
-              <div style={{ background: `${cycle.color}15`, border: `2px solid ${cycle.color}40`, borderRadius: 14, padding: 16, marginBottom: 24, display: "flex", alignItems: "center", gap: 12 }}>
-                <div style={{ width: 10, height: 10, borderRadius: "50%", background: cycle.color, flexShrink: 0 }} />
+              {/* Learning cycle status */}
+              <div style={{ background: `${cycle.color}15`, border: `2px solid ${cycle.color}40`, borderRadius: 14, padding: 16, marginBottom: 20, display: "flex", alignItems: "center", gap: 12 }}>
+                <div style={{ width: 10, height: 10, borderRadius: "50%", background: cycle.color }} />
                 <div>
-                  <div style={{ fontSize: 12, color: colors.muted, fontWeight: 700 }}>LEARNING CYCLE STATUS</div>
-                  <div style={{ fontSize: 15, fontWeight: 800, color: colors.primary }}>{cycle.label}</div>
+                  <div style={{ fontSize: 11, color: C.muted, fontWeight: 700 }}>LEARNING CYCLE</div>
+                  <div style={{ fontSize: 15, fontWeight: 800, color: C.primary }}>{cycle.label}</div>
                 </div>
                 <div style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
-                  {["Assessment", "Week 1 Plan", "Evaluate", "Next/Modify"].map((s, i) => (
-                    <div key={i} style={{ width: 8, height: 8, borderRadius: "50%", background: i < cycle.step ? colors.success : i === cycle.step ? cycle.color : colors.border }} title={s} />
+                  {["Assessment", "Plan", "Evaluate", "Advance"].map((s, i) => (
+                    <div key={i} style={{ width: 8, height: 8, borderRadius: "50%", background: i < cycle.step ? C.success : i === cycle.step ? cycle.color : C.border }} title={s} />
                   ))}
                 </div>
               </div>
 
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 16, marginBottom: 24 }}>
+              {/* Grade banner */}
+              <div style={{ background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 14, padding: 14, marginBottom: 20 }}>
+                <div style={{ fontWeight: 800, color: "#1d4ed8", marginBottom: 8 }}>📚 {gradeInfo.label} Curriculum ({curriculumEngine.getAgeRangeForGrade(grade)})</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                  {gradeInfo.subjects.map(s => <span key={s.name} style={{ background: "#dbeafe", color: "#1d4ed8", padding: "3px 10px", borderRadius: 20, fontSize: 12, fontWeight: 700 }}>{s.icon} {s.name}</span>)}
+                </div>
+              </div>
+
+              {/* Stats */}
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 14, marginBottom: 20 }}>
                 {[
                   { label: "Current Score", value: latestScore !== undefined ? `${latestScore}/100` : "—", icon: "🎯", color: "#dbeafe" },
-                  { label: "Week Trend", value: trend !== 0 ? `${trend >= 0 ? "+" : ""}${trend}` : "—", icon: trend >= 0 ? "📈" : "📉", color: trend >= 0 ? "#d1fae5" : "#fee2e2" },
-                  { label: "IEP Plans", value: iepPlans.length, icon: "📋", color: "#ffedd5" },
-                  { label: "Evaluations", value: weeklyEvals.length, icon: "📊", color: "#ede9fe" },
+                  { label: "Week Trend",    value: trend !== 0 ? `${trend >= 0 ? "+" : ""}${trend}` : "—", icon: trend >= 0 ? "📈" : "📉", color: trend >= 0 ? "#d1fae5" : "#fee2e2" },
+                  { label: "IEP Plans",    value: iepPlans.length,     icon: "📋", color: "#ffedd5" },
+                  { label: "Evaluations",  value: weeklyEvals.length,  icon: "📊", color: "#ede9fe" },
                 ].map(stat => (
-                  <Card key={stat.label} style={{ background: stat.color, border: "none", textAlign: "center", padding: "18px 14px" }}>
-                    <div style={{ fontSize: 28, marginBottom: 6 }}>{stat.icon}</div>
-                    <div style={{ fontSize: 22, fontWeight: 900, color: colors.primary }}>{stat.value}</div>
-                    <div style={{ fontSize: 12, color: colors.muted, fontWeight: 700 }}>{stat.label}</div>
+                  <Card key={stat.label} style={{ background: stat.color, border: "none", textAlign: "center", padding: "16px 12px" }}>
+                    <div style={{ fontSize: 26, marginBottom: 6 }}>{stat.icon}</div>
+                    <div style={{ fontSize: 20, fontWeight: 900, color: C.primary }}>{stat.value}</div>
+                    <div style={{ fontSize: 12, color: C.muted, fontWeight: 700 }}>{stat.label}</div>
                   </Card>
                 ))}
               </div>
 
-              {/* Feature 1: Current week milestones on overview */}
               {latestPlan && milestoneService.getMilestonesByWeek(user.userId, latestPlan.weekNumber) && (
-                <Card style={{ marginBottom: 20 }}>
-                  <div style={{ fontWeight: 800, color: colors.primary, marginBottom: 12 }}>🏁 Week {latestPlan.weekNumber} Milestones</div>
+                <Card style={{ marginBottom: 18 }}>
+                  <div style={{ fontWeight: 800, color: C.primary, marginBottom: 12 }}>🏁 Week {latestPlan.weekNumber} Milestones</div>
                   <MilestoneTracker childId={user.userId} week={latestPlan.weekNumber} refreshKey={refreshKey} />
                 </Card>
               )}
 
-              {latestPlan && (
-                <Card style={{ marginBottom: 20 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
-                    <h3 style={{ fontWeight: 800, color: colors.primary }}>Current Week Plan</h3>
-                    <div style={{ display: "flex", gap: 8 }}>
-                      <Badge color={latestPlan.status === "Achieved" ? "green" : latestPlan.status === "ONGOING" ? "teal" : "orange"}>{latestPlan.status}</Badge>
-                      {!assessmentService.hasPendingEvaluation(user.userId, latestPlan.weekNumber) && (
-                        <Button onClick={() => handleStartEval(latestPlan)} size="sm" variant="secondary">📝 Take Weekly Test</Button>
-                      )}
-                      {assessmentService.hasPendingEvaluation(user.userId, latestPlan.weekNumber) && <Badge color="green">Evaluated ✓</Badge>}
-                    </div>
-                  </div>
-                  <p style={{ color: colors.text, marginBottom: 14, fontSize: 14 }}><strong>Goal:</strong> {latestPlan.learningOutcome}</p>
-                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(155px, 1fr))", gap: 8 }}>
-                    {latestPlan.weeklyPlan.map((day, i) => (
-                      <div key={i} style={{ padding: 12, background: colors.soft, borderRadius: 10 }}>
-                        <div style={{ fontWeight: 800, color: colors.secondary, fontSize: 12 }}>{day.day}</div>
-                        <div style={{ fontSize: 12, marginTop: 4 }}>{day.activity}</div>
-                        <div style={{ fontSize: 11, color: colors.muted, marginTop: 3 }}>🎯 {day.goal}</div>
-                      </div>
-                    ))}
-                  </div>
-                </Card>
-              )}
-
-              {/* Feature 2: Mini progress graph on overview */}
               {assessments.length > 0 && (
-                <Card>
-                  <div style={{ fontWeight: 800, color: colors.primary, marginBottom: 12 }}>📈 Progress Overview</div>
-                  <ProgressGraph childId={user.userId} />
-                </Card>
+                <Card><div style={{ fontWeight: 800, color: C.primary, marginBottom: 12 }}>📈 Progress</div><ProgressGraph childId={user.userId} /></Card>
               )}
             </div>
           )}
 
-          {/* ASSESSMENT TAB — preserved */}
-          {activeTab === "assessment" && (
+          {/* MY IEP */}
+          {activeTab === "iep" && (
             <div className="fade-in">
-              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: colors.primary, marginBottom: 20 }}>{parent?.childName}'s Initial Assessment</h2>
-              {!initAssmt ? (
-                <Alert type="warning">Initial assessment not completed yet.</Alert>
-              ) : (
-                <>
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 20 }}>
-                    <Card style={{ textAlign: "center" }}>
-                      <div style={{ fontSize: 48, fontWeight: 900, color: colors.primary }}>{initAssmt.totalScore}<span style={{ fontSize: 20, color: colors.muted }}>/100</span></div>
-                      <div style={{ marginTop: 8 }}><ScoreBadge score={initAssmt.totalScore} /></div>
-                      <div style={{ fontSize: 12, color: colors.muted, marginTop: 8 }}>Completed: {initAssmt.completedAt}</div>
-                    </Card>
-                    <Card>
-                      <div style={{ fontWeight: 800, color: colors.primary, marginBottom: 12 }}>Score Breakdown</div>
-                      {initAssmt.answers.map((ans, i) => {
-                        const q = initAssmt.questions?.[i];
-                        const score = q?.scoring?.[ans.answer] ?? ans.score ?? 0;
-                        return (
-                          <div key={i} style={{ marginBottom: 10 }}>
-                            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 3 }}>
-                              <span style={{ fontWeight: 700, textTransform: "capitalize", color: colors.muted }}>{q?.category || `Q${i + 1}`}</span>
-                              <span style={{ fontWeight: 800, color: colors.primary }}>{score}/3</span>
-                            </div>
-                            <ProgressBar value={score} max={3} height={6} color={score >= 2 ? colors.success : score === 1 ? colors.warning : colors.danger} />
-                          </div>
-                        );
-                      })}
-                    </Card>
-                  </div>
-                </>
-              )}
+              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: C.primary, marginBottom: 20 }}>🎓 {parent?.childName}'s IEP</h2>
+              <IEPViewer userId={user.userId} childName={parent?.childName} />
             </div>
           )}
 
-          {/* PLANS TAB — preserved */}
+          {/* WEEKLY PLANS */}
           {activeTab === "plans" && (
             <div className="fade-in">
-              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: colors.primary, marginBottom: 20 }}>Learning Plans for {parent?.childName}</h2>
-              {iepPlans.length === 0 && <Alert type="info">No plans yet. Your educator will generate one after your child's initial assessment.</Alert>}
+              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: C.primary, marginBottom: 20 }}>Weekly Plans</h2>
+              {iepPlans.length === 0 && <Alert type="info">No plans yet. Your educator will generate one after your child's assessment.</Alert>}
               {iepPlans.slice().reverse().map(plan => (
-                <Card key={plan.id} style={{ marginBottom: 20 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 16, flexWrap: "wrap", gap: 10 }}>
+                <Card key={plan.id} style={{ marginBottom: 18 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 14, flexWrap: "wrap", gap: 8 }}>
                     <div>
-                      <div style={{ fontWeight: 900, fontSize: 18, color: colors.primary }}>Week {plan.weekNumber} Plan</div>
-                      <div style={{ color: colors.muted, fontSize: 13, marginTop: 4 }}>{plan.learningOutcome}</div>
+                      <div style={{ fontWeight: 900, fontSize: 18, color: C.primary }}>Week {plan.weekNumber} Plan</div>
+                      <div style={{ color: C.muted, fontSize: 13, marginTop: 4 }}>{plan.learningOutcome}</div>
                     </div>
-                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-start" }}>
-                      <Badge color={plan.status === "Achieved" ? "green" : plan.status === "ONGOING" ? "teal" : "orange"}>{plan.status}</Badge>
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                      <Badge color={plan.status === "Achieved" ? "green" : "teal"}>{plan.status}</Badge>
                       {plan.aiModified && <Badge color="purple">AI Modified</Badge>}
                       {!assessmentService.hasPendingEvaluation(user.userId, plan.weekNumber) && (
                         <Button onClick={() => handleStartEval(plan)} size="sm" variant="secondary">📝 Evaluate</Button>
                       )}
                     </div>
                   </div>
-                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(155px, 1fr))", gap: 10, marginBottom: 14 }}>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(145px, 1fr))", gap: 10 }}>
                     {plan.weeklyPlan.map((day, i) => (
-                      <div key={i} style={{ padding: 14, background: ["#eff6ff","#f0fdf4","#fffbeb","#fdf4ff","#fef2f2"][i % 5], borderRadius: 12 }}>
-                        <div style={{ fontWeight: 800, fontSize: 13, marginBottom: 6, color: colors.primary }}>{day.day}</div>
-                        <div style={{ fontSize: 12, fontWeight: 600 }}>{day.activity}</div>
-                        <div style={{ fontSize: 11, color: colors.muted, marginTop: 4 }}>🎯 {day.goal}</div>
+                      <div key={i} style={{ padding: 12, background: ["#eff6ff","#f0fdf4","#fffbeb","#fdf4ff","#fef2f2"][i % 5], borderRadius: 12 }}>
+                        <div style={{ fontWeight: 800, fontSize: 12, color: C.primary, marginBottom: 4 }}>{day.day}</div>
+                        <div style={{ fontSize: 11, fontWeight: 600 }}>{day.activity}</div>
+                        <div style={{ fontSize: 11, color: C.muted, marginTop: 3 }}>🎯 {day.goal}</div>
                       </div>
                     ))}
                   </div>
@@ -2056,116 +2155,107 @@ const ParentDashboard = ({ user, onLogout }) => {
             </div>
           )}
 
-          {/* NEW: MILESTONES TAB — Feature 1 */}
+          {/* MILESTONES */}
           {activeTab === "milestones" && (
             <div className="fade-in">
-              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: colors.primary, marginBottom: 20 }}>🏁 {parent?.childName}'s Milestones</h2>
-              <p style={{ color: colors.muted, marginBottom: 20 }}>Track weekly goals. Milestones update automatically after each evaluation.</p>
-              {milestoneService.getMilestonesByChild(user.userId).length === 0 ? (
-                <Alert type="info">No milestones yet. They'll appear automatically when your educator creates a learning plan.</Alert>
-              ) : (
-                milestoneService.getMilestonesByChild(user.userId).map(record => (
-                  <Card key={record.id} style={{ marginBottom: 16 }}>
-                    <MilestoneTracker childId={user.userId} week={record.week} refreshKey={refreshKey} />
+              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: C.primary, marginBottom: 20 }}>🏁 Milestones</h2>
+              <p style={{ color: C.muted, marginBottom: 20 }}>Auto-updated after each evaluation. Tap any milestone to toggle.</p>
+              {milestoneService.getMilestonesByChild(user.userId).length === 0
+                ? <Alert type="info">Milestones appear automatically when your educator creates a plan.</Alert>
+                : milestoneService.getMilestonesByChild(user.userId).map(rec => (
+                  <Card key={rec.id} style={{ marginBottom: 14 }}>
+                    <MilestoneTracker childId={user.userId} week={rec.week} refreshKey={refreshKey} />
                   </Card>
                 ))
-              )}
+              }
             </div>
           )}
 
-          {/* NEW: PROGRESS TAB — Feature 2 */}
+          {/* PROGRESS */}
           {activeTab === "progress" && (
             <div className="fade-in">
-              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: colors.primary, marginBottom: 20 }}>📈 Progress Graph</h2>
-              <p style={{ color: colors.muted, marginBottom: 20 }}>Track {parent?.childName}'s score progression week by week.</p>
-              <Card>
-                <ProgressGraph childId={user.userId} />
-              </Card>
+              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: C.primary, marginBottom: 20 }}>📈 Progress Graph</h2>
+              <Card><ProgressGraph childId={user.userId} /></Card>
             </div>
           )}
 
-          {/* NEW: SUMMARIES TAB — Feature 3 */}
+          {/* SUMMARIES — EN + TA toggle (v4 language fix) */}
           {activeTab === "summaries" && (
             <div className="fade-in">
-              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: colors.primary, marginBottom: 8 }}>📝 Weekly Summaries</h2>
-              <p style={{ color: colors.muted, marginBottom: 20 }}>AI-generated summaries in English and Tamil (தமிழ்), created after each weekly evaluation.</p>
-              <WeeklySummaryCard childId={user.userId} />
+              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: C.primary, marginBottom: 8 }}>📝 Weekly Summaries</h2>
+              <p style={{ color: C.muted, marginBottom: 4 }}>AI-generated summaries in English and Tamil.</p>
+              <Alert type="info" style={{ marginBottom: 16 }}>
+                <strong>v4 Language Update:</strong> Summaries are now generated in English and Tamil only — both languages are fully reliable. Selecting other languages previously showed incorrect or missing content.
+              </Alert>
+              <WeeklySummaryCard childId={user.userId} preferredLanguage={parent?.preferredLanguage} />
             </div>
           )}
 
-          {/* EVALUATIONS TAB — preserved */}
+          {/* EVALUATIONS */}
           {activeTab === "evaluations" && (
             <div className="fade-in">
-              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: colors.primary, marginBottom: 20 }}>Weekly Evaluations</h2>
+              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: C.primary, marginBottom: 20 }}>Weekly Evaluations</h2>
               {weeklyEvals.length === 0 ? (
                 <div>
-                  <Alert type="info">No evaluations completed yet. Once you have a learning plan, you can take weekly evaluations.</Alert>
+                  <Alert type="info">No evaluations yet. Start one from the Plans tab.</Alert>
                   {latestPlan && !assessmentService.hasPendingEvaluation(user.userId, latestPlan.weekNumber) && (
                     <Card style={{ textAlign: "center", padding: 32 }}>
-                      <div style={{ fontSize: 48, marginBottom: 16 }}>📝</div>
-                      <h3 style={{ fontWeight: 800, color: colors.primary, marginBottom: 8 }}>Week {latestPlan.weekNumber} Evaluation Ready</h3>
-                      <Button onClick={() => handleStartEval(latestPlan)} size="lg">Start Week {latestPlan.weekNumber} Evaluation →</Button>
+                      <div style={{ fontSize: 48, marginBottom: 12 }}>📝</div>
+                      <h3 style={{ fontWeight: 800, color: C.primary, marginBottom: 8 }}>Week {latestPlan.weekNumber} Evaluation Ready</h3>
+                      <Button onClick={() => handleStartEval(latestPlan)} size="lg">Start →</Button>
                     </Card>
                   )}
                 </div>
-              ) : (
-                <div>
-                  {weeklyEvals.slice().reverse().map(ev => (
-                    <Card key={ev.id} style={{ marginBottom: 20 }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 16, flexWrap: "wrap", gap: 10 }}>
-                        <div>
-                          <div style={{ fontWeight: 900, fontSize: 18, color: colors.primary }}>Week {ev.weekNumber} Evaluation</div>
-                          <div style={{ fontSize: 13, color: colors.muted }}>{ev.completedAt}</div>
-                        </div>
-                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                          <Badge color={ev.aiDecision === "ADVANCE" ? "green" : "orange"}>{ev.aiDecision === "ADVANCE" ? "✅ ADVANCED" : "🔄 MODIFIED"}</Badge>
-                          <Badge color={ev.improvement >= 0 ? "green" : "red"}>{ev.score}/100 {ev.improvement >= 0 ? `(+${ev.improvement})` : `(${ev.improvement})`}</Badge>
-                        </div>
-                      </div>
-                      <div style={{ background: ev.aiDecision === "ADVANCE" ? "#d1fae5" : "#ffedd5", borderRadius: 12, padding: 16, marginBottom: 14 }}>
-                        <div style={{ fontWeight: 800, color: ev.aiDecision === "ADVANCE" ? "#065f46" : "#9a3412", fontSize: 13, marginBottom: 6 }}>🤖 AI Decision & Reasoning</div>
-                        <p style={{ fontSize: 13, color: colors.text, lineHeight: 1.6 }}>{ev.aiReasoning}</p>
-                      </div>
-                      {ev.encouragementMessage && (
-                        <div style={{ background: "#f5f3ff", borderRadius: 10, padding: 12, marginBottom: 14, textAlign: "center" }}>
-                          <p style={{ fontSize: 14, color: "#5b21b6", fontWeight: 600, fontStyle: "italic" }}>💬 "{ev.encouragementMessage}"</p>
-                        </div>
-                      )}
-                    </Card>
-                  ))}
-                </div>
-              )}
+              ) : weeklyEvals.slice().reverse().map(ev => (
+                <Card key={ev.id} style={{ marginBottom: 18 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 14, flexWrap: "wrap", gap: 8 }}>
+                    <div>
+                      <div style={{ fontWeight: 900, fontSize: 18, color: C.primary }}>Week {ev.weekNumber}</div>
+                      <div style={{ fontSize: 13, color: C.muted }}>{ev.completedAt}</div>
+                    </div>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <Badge color={ev.aiDecision === "ADVANCE" ? "green" : "orange"}>{ev.aiDecision === "ADVANCE" ? "✅ ADVANCED" : "🔄 MODIFIED"}</Badge>
+                      <Badge color={ev.improvement >= 0 ? "green" : "red"}>{ev.score}/100 ({ev.improvement >= 0 ? "+" : ""}{ev.improvement})</Badge>
+                    </div>
+                  </div>
+                  <div style={{ background: ev.aiDecision === "ADVANCE" ? "#d1fae5" : "#ffedd5", borderRadius: 12, padding: 14, marginBottom: 12 }}>
+                    <div style={{ fontWeight: 800, fontSize: 13, marginBottom: 6, color: ev.aiDecision === "ADVANCE" ? "#065f46" : "#9a3412" }}>🤖 AI Reasoning</div>
+                    <p style={{ fontSize: 13, color: C.text, lineHeight: 1.6 }}>{ev.aiReasoning}</p>
+                  </div>
+                  {ev.encouragementMessage && (
+                    <div style={{ background: "#f5f3ff", borderRadius: 10, padding: 12, textAlign: "center" }}>
+                      <p style={{ fontSize: 14, color: "#5b21b6", fontWeight: 600, fontStyle: "italic" }}>💬 "{ev.encouragementMessage}"</p>
+                    </div>
+                  )}
+                </Card>
+              ))}
             </div>
           )}
 
-          {/* FEEDBACK TAB — preserved */}
+          {/* FEEDBACK */}
           {activeTab === "feedback" && (
             <div className="fade-in">
-              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: colors.primary, marginBottom: 20 }}>Send Feedback</h2>
-              {!educator && <Alert type="warning">No educator assigned yet. You'll be able to send feedback once an educator is matched.</Alert>}
-              {educator && <Alert type="info">Sending to: <strong>{educator.name}</strong> ({educator.educatorType} Specialist)</Alert>}
-              <Card style={{ marginBottom: 24, maxWidth: 560 }}>
-                <div style={{ marginBottom: 16 }}>
-                  <label style={{ display: "block", fontWeight: 700, fontSize: 13, color: colors.primary, marginBottom: 8 }}>Rating</label>
-                  <div style={{ display: "flex", gap: 8 }}>
-                    {[1, 2, 3, 4, 5].map(r => (
-                      <button key={r} onClick={() => setFbRating(r)} style={{ fontSize: 28, border: "none", background: "none", cursor: "pointer", opacity: r <= fbRating ? 1 : 0.3 }}>★</button>
-                    ))}
-                  </div>
+              <h2 style={{ fontFamily: "DM Serif Display", fontSize: 26, color: C.primary, marginBottom: 20 }}>Send Feedback</h2>
+              {!educator && <Alert type="warning">No educator assigned yet. Feedback will be available once matched.</Alert>}
+              {educator  && <Alert type="info">Sending to: <strong>{educator.name}</strong> ({educator.educatorType})</Alert>}
+              <Card style={{ marginBottom: 20, maxWidth: 560 }}>
+                <div style={{ marginBottom: 14 }}>
+                  <label style={{ display: "block", fontWeight: 700, fontSize: 13, color: C.primary, marginBottom: 8 }}>Rating</label>
+                  <div style={{ display: "flex", gap: 8 }}>{[1,2,3,4,5].map(r => <button key={r} onClick={() => setFbRating(r)} style={{ fontSize: 28, border: "none", background: "none", cursor: "pointer", opacity: r <= fbRating ? 1 : 0.3 }}>★</button>)}</div>
                 </div>
-                <div style={{ marginBottom: 16 }}>
-                  <label style={{ display: "block", fontWeight: 700, fontSize: 13, color: colors.primary, marginBottom: 8 }}>Your Message</label>
-                  <textarea value={fbMsg} onChange={e => setFbMsg(e.target.value)} placeholder="Share your observations, concerns, or appreciation…" rows={5} style={{ width: "100%", padding: "12px 14px", border: `1.5px solid ${colors.border}`, borderRadius: 10, fontFamily: "Nunito", fontSize: 14, resize: "vertical", outline: "none" }} />
+                <div style={{ marginBottom: 14 }}>
+                  <label style={{ display: "block", fontWeight: 700, fontSize: 13, color: C.primary, marginBottom: 8 }}>Message</label>
+                  <textarea value={fbMsg} onChange={e => setFbMsg(e.target.value)} placeholder="Share observations, concerns, or appreciation…" rows={4} style={{ width: "100%", padding: "10px 12px", border: `1.5px solid ${C.border}`, borderRadius: 10, fontFamily: "Nunito", fontSize: 14, resize: "vertical", outline: "none" }} />
                 </div>
                 <Button onClick={handleFeedback} variant="secondary" size="lg" disabled={fbSubmitting || !educator}>{fbSubmitting ? "Sending…" : "Send Feedback →"}</Button>
               </Card>
               {myFeedback.map(fb => (
-                <Card key={fb.id} style={{ marginBottom: 12 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
-                    <span style={{ fontSize: 13, color: colors.muted }}>{fb.date}</span>
+                <Card key={fb.id} style={{ marginBottom: 10 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+                    <span style={{ fontSize: 13, color: C.muted }}>{fb.date}</span>
                     <span style={{ color: "#f5a623" }}>{"★".repeat(fb.rating)}</span>
                   </div>
-                  <p style={{ fontSize: 14, color: colors.text }}>{fb.message}</p>
+                  <p style={{ fontSize: 14, color: C.text }}>{fb.message}</p>
                 </Card>
               ))}
             </div>
@@ -2176,38 +2266,39 @@ const ParentDashboard = ({ user, onLogout }) => {
   );
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ROOT APP — Preserved from v1 (unchanged)
-// ─────────────────────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════════
+// SECTION 12 — ROOT APP
+// isNewUser → MultiDomainAssessmentFlow → Dashboard
+// ════════════════════════════════════════════════════════════════════════════════
 
 export default function App() {
-  const [auth, setAuth] = useState(null);
+  const [auth, setAuth]   = useState(null);
   const [loading, setLoading] = useState(true);
-  const [showInitialAssessment, setShowInitialAssessment] = useState(false);
+  const [showAssessment, setShowAssessment] = useState(false);
 
   useEffect(() => {
-    const token = localStorage.getItem("snep_token");
-    const role = localStorage.getItem("snep_role");
+    const token  = localStorage.getItem("snep_token");
+    const role   = localStorage.getItem("snep_role");
     const userId = localStorage.getItem("snep_userId");
     if (token && role && userId) {
       setAuth({ token, role, userId });
       if (role === "parent") {
         const parent = assessmentService.getParentById(userId);
-        if (parent && !assessmentService.hasCompletedInitialAssessment(userId)) {
-          setShowInitialAssessment(true);
+        if (parent?.isNewUser && !assessmentService.hasCompletedInitialAssessment(userId)) {
+          setShowAssessment(true);
         }
       }
     }
     setLoading(false);
   }, []);
 
-  const handleLogin = useCallback((res) => {
+  const handleLogin = useCallback(res => {
     localStorage.setItem("snep_token", res.token);
-    localStorage.setItem("snep_role", res.role);
+    localStorage.setItem("snep_role",  res.role);
     localStorage.setItem("snep_userId", res.user.id);
     setAuth({ token: res.token, role: res.role, userId: res.user.id });
-    if (res.role === "parent" && (res.requiresInitialAssessment || !assessmentService.hasCompletedInitialAssessment(res.user.id))) {
-      setShowInitialAssessment(true);
+    if (res.role === "parent" && (res.requiresInitialAssessment || res.user.isNewUser)) {
+      setShowAssessment(true);
     }
   }, []);
 
@@ -2215,23 +2306,162 @@ export default function App() {
     localStorage.removeItem("snep_token");
     localStorage.removeItem("snep_role");
     localStorage.removeItem("snep_userId");
-    setAuth(null); setShowInitialAssessment(false);
+    setAuth(null); setShowAssessment(false);
   }, []);
 
-  const handleAssessmentComplete = useCallback(() => { setShowInitialAssessment(false); }, []);
+  const handleAssessmentComplete = useCallback(() => {
+    setShowAssessment(false);
+  }, []);
 
   if (loading) return (
-    <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", background: colors.gradient }}>
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", background: C.gradient }}>
+      <style>{G}</style>
       <Spinner size={48} color="#fff" />
     </div>
   );
 
   if (!auth) return <AuthPage onLogin={handleLogin} />;
-  if (auth.role === "parent" && showInitialAssessment) {
+
+  if (auth.role === "parent" && showAssessment) {
     const parent = assessmentService.getParentById(auth.userId);
-    return <InitialAssessmentFlow parent={parent} onComplete={handleAssessmentComplete} />;
+    return <MultiDomainAssessmentFlow parent={parent} onComplete={handleAssessmentComplete} />;
   }
+
   if (auth.role === "educator") return <EducatorDashboard user={auth} onLogout={handleLogout} />;
-  if (auth.role === "parent") return <ParentDashboard user={auth} onLogout={handleLogout} />;
+  if (auth.role === "parent")   return <ParentDashboard   user={auth} onLogout={handleLogout} />;
   return <AuthPage onLogin={handleLogin} />;
 }
+
+/*
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * BACKEND CODE  (Node.js + Express + MongoDB)
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * /models/User.js
+ * ───────────────
+ * const userSchema = new mongoose.Schema({
+ *   parentName:           { type: String, required: true },
+ *   childName:            { type: String, required: true },
+ *   age:                  { type: Number, required: true },
+ *   disabilityType:       { type: String, required: true },
+ *   email:                { type: String, required: true, unique: true },
+ *   password:             { type: String, required: true },
+ *   preferredLanguage:    { type: String, enum: ["English", "Tamil"], default: "English" },
+ *   uniqueChildID:        { type: String },
+ *   assignedEducatorID:   { type: mongoose.Schema.Types.ObjectId, ref: "Educator" },
+ *   isNewUser:            { type: Boolean, default: true },
+ *   initialAssessmentDone:{ type: Boolean, default: false },
+ *   gradeLevel:           { type: Number },  // computed: age - 4 (clamped 1–12)
+ * }, { timestamps: true });
+ *
+ * /models/Assessment.js
+ * ──────────────────────
+ * const assessmentSchema = new mongoose.Schema({
+ *   userId:              { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+ *   iqScore:             { type: Number, min: 0, max: 100 },
+ *   cognitiveScore:      { type: Number, min: 0, max: 100 },
+ *   motorScore:          { type: Number, min: 0, max: 100 },
+ *   communicationScore:  { type: Number, min: 0, max: 100 },
+ *   overallLevel:        { type: String, enum: ["LOW", "MEDIUM", "HIGH"] },
+ *   breakdown:           { type: mongoose.Schema.Types.Mixed },
+ *   completedAt:         { type: Date, default: Date.now },
+ * });
+ *
+ * /models/EducationPlan.js
+ * ─────────────────────────
+ * const educationPlanSchema = new mongoose.Schema({
+ *   userId:       { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+ *   gradeLevel:   { type: Number, required: true },
+ *   subjects:     [{ name: String, icon: String, gradeGoal: String, modifiedGoal: String }],
+ *   goals:        { academic: [String], functional: [String] },
+ *   recommendations: [String],
+ *   accommodations:  [String],
+ *   generatedAt:     { type: Date, default: Date.now },
+ * });
+ *
+ * /routes/assessment.js
+ * ──────────────────────
+ * // POST /api/assessment
+ * router.post("/", async (req, res) => {
+ *   const { userId, domainScores } = req.body;
+ *   const total = (domainScores.iq + domainScores.cognitive + domainScores.motor + domainScores.communication) / 4;
+ *   const overallLevel = total < 40 ? "LOW" : total < 70 ? "MEDIUM" : "HIGH";
+ *   const record = await Assessment.findOneAndUpdate(
+ *     { userId },
+ *     { ...domainScores.map(k => ({ [k + "Score"]: domainScores[k] })), overallLevel },
+ *     { upsert: true, new: true }
+ *   );
+ *   res.json({ success: true, record });
+ * });
+ *
+ * /routes/educationPlan.js
+ * ─────────────────────────
+ * // GET /api/education-plan/:userId
+ * router.get("/:userId", async (req, res) => {
+ *   const user       = await User.findById(req.params.userId);
+ *   const assessment = await Assessment.findOne({ userId: req.params.userId });
+ *   const grade      = getGradeFromAge(user.age);       // age - 4, clamped 1–12
+ *   const gradeInfo  = getSubjectsForGrade(grade);
+ *
+ *   // IF new user: assessment must exist
+ *   if (user.isNewUser && !assessment) return res.status(400).json({ error: "Complete assessment first" });
+ *
+ *   let plan = await EducationPlan.findOne({ userId: req.params.userId });
+ *   if (!plan) {
+ *     // Generate via AI, save to DB
+ *     const iepData = await generateIEP(user, assessment, grade, gradeInfo);
+ *     plan = await EducationPlan.create({ userId: user._id, ...iepData });
+ *   }
+ *   res.json(plan);
+ * });
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * SAMPLE IEP OUTPUT JSON
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * {
+ *   "userId": "par1",
+ *   "gradeLevel": 5,
+ *   "gradeLabel": "Grade 5",
+ *   "overallLevel": "MEDIUM",
+ *   "subjects": [
+ *     { "name": "Mathematics", "icon": "🔢",
+ *       "gradeGoal": "Decimals, percentages, area, perimeter",
+ *       "modifiedGoal": "With scaffolded support, work on single-digit decimals and basic area using grid paper" },
+ *     { "name": "Science", "icon": "🔬",
+ *       "gradeGoal": "Human body, ecosystems, forces, light",
+ *       "modifiedGoal": "Identify major body organs from labelled diagram; describe one ecosystem with visual support" },
+ *     { "name": "English", "icon": "📖",
+ *       "gradeGoal": "Literature, formal writing, vocabulary",
+ *       "modifiedGoal": "Read simplified passages (Grade 3 level), write 3-sentence responses with sentence starters" },
+ *     { "name": "Social Science", "icon": "🌏",
+ *       "gradeGoal": "Ancient civilisations, Indian geography",
+ *       "modifiedGoal": "Identify 3 ancient civilisations from picture cards; locate India and home state on a map" }
+ *   ],
+ *   "goals": {
+ *     "academic": [
+ *       "With moderate support, the student will add and subtract decimals to one place using a number line",
+ *       "With moderate support, the student will read and retell a simplified story in 3 sentences",
+ *       "With peer support, the student will complete a structured science worksheet with 80% accuracy"
+ *     ],
+ *     "functional": [
+ *       "Follow a visual daily schedule independently for 5 consecutive school days",
+ *       "Initiate requesting help from the teacher using a pre-taught phrase or AAC symbol",
+ *       "Participate in a structured group activity for 15 minutes with minimal prompting"
+ *     ]
+ *   },
+ *   "recommendations": [
+ *     "Use graphic organisers and visual maps for all subjects",
+ *     "Pair abstract concepts with real-world concrete examples",
+ *     "Implement cooperative learning with a trained peer buddy",
+ *     "Provide choice boards to increase motivation and agency"
+ *   ],
+ *   "accommodations": [
+ *     "Extended time (1.5×) for all assessments",
+ *     "Modified worksheets with reduced item count and larger font",
+ *     "Oral response option for written assessments",
+ *     "Access to quiet break area with 5-minute sensory breaks every 30 minutes"
+ *   ],
+ *   "generatedAt": "2025-01-15T10:30:00.000Z"
+ * }
+ */
