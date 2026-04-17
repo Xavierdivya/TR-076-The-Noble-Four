@@ -1,5 +1,8 @@
 # 🚀 EduPath AI - Special Needs Education Plan Generator
 
+🚀 **Live Website:**  
+👉 https://edupath-ai-iota.vercel.app/
+
 EduPath AI is an intelligent learning platform designed for children with special needs. It uses AI to create personalized learning plans, track progress, and support both parents and educators.
 
 ---
