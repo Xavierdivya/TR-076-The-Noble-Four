@@ -420,14 +420,21 @@ let mockDB = {
 // ════════════════════════════════════════════════════════════════════════════════
 
 const _callClaude = async (prompt, maxTokens = 1200) => {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: maxTokens, messages: [{ role: "user", content: prompt }] }),
-  });
-  const data = await res.json();
-  const text = (data.content ?? []).map(b => b.text ?? "").join("");
-  return JSON.parse(text.replace(/```json|```/g, "").trim());
+  const fakeResponses = [
+    "The child shows moderate cognitive development. A structured plan with visual aids and repetition is recommended.",
+    "Assessment indicates improvement in motor skills. Include more hands-on activities for better engagement.",
+    "The learner demonstrates good communication ability. Speech-based exercises can further enhance progress.",
+    "AI suggests focusing on personalized weekly goals with gradual difficulty increase.",
+    "The child is progressing steadily. A mix of visual and interactive learning will improve outcomes."
+  ];
+
+  // simulate delay (optional but realistic)
+  await new Promise(resolve => setTimeout(resolve, 1500));
+
+  const fakeResult =
+    fakeResponses[Math.floor(Math.random() * fakeResponses.length)];
+
+  return fakeResult;
 };
 
 const aiService = {
@@ -2330,6 +2337,22 @@ export default function App() {
   if (auth.role === "educator") return <EducatorDashboard user={auth} onLogout={handleLogout} />;
   if (auth.role === "parent")   return <ParentDashboard   user={auth} onLogout={handleLogout} />;
   return <AuthPage onLogin={handleLogin} />;
+
+  const getFakeAIResponse = (input) => {
+  const responses = [
+    `Based on the assessment, the child shows moderate cognitive abilities with strong potential in communication. A structured learning plan with visual aids is recommended.`,
+    
+    `The analysis indicates improvement in motor skills. Introducing interactive activities and guided exercises can further enhance development.`,
+    
+    `The child demonstrates good progress in memory and pattern recognition. Increasing difficulty gradually will help strengthen learning outcomes.`,
+    
+    `AI Recommendation: Focus on personalized weekly goals, including speech exercises and motor coordination tasks for balanced development.`,
+    
+    `The learner is progressing steadily. A mix of visual, auditory, and hands-on activities will improve engagement and retention.`
+  ];
+
+  return responses[Math.floor(Math.random() * responses.length)];
+};
 }
 
 /*

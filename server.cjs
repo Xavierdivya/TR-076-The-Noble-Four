@@ -8,7 +8,7 @@ app.use(express.json());
 
 app.post("/api/claude", async (req, res) => {
   try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    const response = await fetch("http://localhost:5000/api/claude"), {
       method: "POST",
       headers: {
         "x-api-key": process.env.ANTHROPIC_API_KEY,
